@@ -130,10 +130,11 @@ class CudaPlatformBase(Platform):
                     parallel_config.worker_cls = \
                             "vllm.v1.worker.gpu_worker.Worker"
                 else:
-                    parallel_config.worker_cls = \
-                        "vllm.spec_decode.spec_decode_worker.create_spec_worker"
-                    parallel_config.sd_worker_cls = \
-                        "vllm.worker.worker.Worker"
+                    # [Spexis] V0 speculative decoding was removed; this
+                    # fork's speculative pipelining requires the V1 engine.
+                    raise NotImplementedError(
+                        "Speculative decoding requires the V1 engine in "
+                        "this fork. Please run with VLLM_USE_V1=1.")
             else:
                 if envs.VLLM_USE_V1:
                     parallel_config.worker_cls = \
@@ -213,10 +214,8 @@ class CudaPlatformBase(Platform):
                         return ("vllm.attention.backends."
                                 "flashmla.FlashMLABackend")
         if use_v1:
-            if selected_backend == _Backend.TRITON_ATTN_VLLM_V1:
-                logger.info_once("Using Triton backend on V1 engine.")
-                return ("vllm.v1.attention.backends."
-                        "triton_attn.TritonAttentionBackend")
+            # [Spexis] the Triton V1 backend was ROCm-oriented and is not
+            # shipped in this fork; FlashAttention is the supported path.
             if cls.has_device_capability(80):
                 logger.info_once("Using Flash Attention backend on V1 engine.")
                 return ("vllm.v1.attention.backends."

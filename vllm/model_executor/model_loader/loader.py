@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from typing import (Any, Callable, Dict, Generator, Iterable, List, Optional,
                     Tuple, cast)
 
+
 import gguf
 import huggingface_hub
 import numpy as np
@@ -189,6 +190,33 @@ def _process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             # of process_weights_after_loading
             module.process_weights_after_loading(model_config.dtype)
 
+def _process_lenpred_weights_after_loading(model: nn.Module, model_config_dict: Dict,
+                                   target_device: torch.device) -> None:
+    for _, module in model.named_modules():
+        if isinstance(module, QKVCrossParallelLinear):
+            # NOTE(Isotr0py): special case for cross QKV layer because
+            # q and kv proj aren't registered as submodules intentionally
+            module.process_weights_after_loading()
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if isinstance(quant_method, QuantizeMethodBase):
+            # When quant methods need to process weights after loading
+            # (for repacking, quantizing, etc), they expect parameters
+            # to be on the global target device. This scope is for the
+            # case where cpu offloading is used, where we will move the
+            # parameters onto device for processing and back off after.
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
+
+    # Currently only used by MLA.
+    # NOTE: This intentionally happens after other modules so we can easily
+    # decompress the weights for MLA.
+    for _, module in model.named_modules():
+        if isinstance(module, Attention) and \
+            hasattr(module, "process_weights_after_loading"):
+            # TODO(lucas): see if there is a way to unify the signatures
+            # of process_weights_after_loading
+            module.process_weights_after_loading(model_config_dict["dtype"])    
 
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
@@ -436,6 +464,29 @@ class DefaultModelLoader(BaseModelLoader):
         )
         for source in secondary_weights:
             yield from self._get_weights_iterator(source)
+    
+    def get_all_lenpred_weights(
+        self,
+        model_config_dict: dict,
+        model: nn.Module,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        primary_weights = DefaultModelLoader.Source(
+            model_config_dict["model"],
+            model_config_dict["revision"],
+            prefix="",
+            fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load",
+                                    True),
+            allow_patterns_overrides=getattr(model, "allow_patterns_overrides",
+                                             None),
+        )
+        yield from self._get_weights_iterator(primary_weights)
+
+        secondary_weights = cast(
+            Iterable[DefaultModelLoader.Source],
+            getattr(model, "secondary_weights", ()),
+        )
+        for source in secondary_weights:
+            yield from self._get_weights_iterator(source)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model,
@@ -469,6 +520,79 @@ class DefaultModelLoader(BaseModelLoader):
                         f"checkpoint: {weights_not_loaded}")
 
             _process_weights_after_loading(model, model_config, target_device)
+
+        return model.eval()
+
+    def load_exitmodel(self, vllm_config, model_config, device_config, pp_rank,
+                       model_class) -> nn.Module:
+        target_device = torch.device(device_config.device)
+
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                with set_current_vllm_config(vllm_config, check_compile=True):
+                    model = model_class(vllm_config=vllm_config,
+                                        prefix="adaptermodel",
+                                        pp_rank=pp_rank)
+
+            weights_to_load = {name for name, _ in model.named_parameters()}
+            loaded_weights = model.load_weights(
+                self.get_all_weights(model_config, model))
+            self.counter_after_loading_weights = time.perf_counter()
+            logger.info(
+                "Loading Exit Model weights took %.2f seconds",
+                self.counter_after_loading_weights -
+                self.counter_before_loading_weights)
+            # We only enable strict check for non-quantized models
+            # that have loaded weights tracking currently.
+
+            if model_config.quantization is None and loaded_weights is not None:
+                weights_not_loaded = weights_to_load - loaded_weights
+                if weights_not_loaded:
+                    raise ValueError(
+                        "Following weights were not initialized from "
+                        f"checkpoint: {weights_not_loaded}")
+
+            _process_weights_after_loading(model, model_config, target_device)
+
+        return model.eval()
+
+    def load_length_predictor(self, vllm_config, model_config_dict,
+                                device_config, pp_rank,
+                                model_class) -> nn.Module:
+        target_device = torch.device(device_config.device)
+
+        with set_default_torch_dtype(model_config_dict["dtype"]):
+            with target_device:
+                with set_current_vllm_config(vllm_config,
+                                                check_compile=True):
+                    model = model_class(
+                        in_dim=model_config_dict["in_dim"],
+                        thresholds_list=model_config_dict["thresholds_list"],
+                        hidden=model_config_dict["hidden"],
+                        dropout_p=model_config_dict["dropout_p"],
+                        prefix="lengthpredictor",)
+
+            weights_to_load = {name for name, _ in model.named_parameters()}
+            loaded_weights = model.load_weights(
+                self.get_all_lenpred_weights(model_config_dict, model))
+
+            self.counter_after_loading_weights = time.perf_counter()
+            logger.info(
+                "Loading Length Predictor weights took %.2f seconds",
+                self.counter_after_loading_weights -
+                self.counter_before_loading_weights)
+            # We only enable strict check for non-quantized models
+            # that have loaded weights tracking currently.
+
+            if loaded_weights is not None:
+                weights_not_loaded = weights_to_load - loaded_weights
+                if weights_not_loaded:
+                    raise ValueError(
+                        "Following weights were not initialized from "
+                        f"checkpoint: {weights_not_loaded}")
+
+            _process_lenpred_weights_after_loading(model, model_config_dict,
+                                                   target_device)
 
         return model.eval()
 

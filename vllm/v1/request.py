@@ -54,6 +54,39 @@ class Request:
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
 
+        # [Spexis] Speculation bookkeeping. specpipe_len counts the tokens
+        # appended speculatively but not yet verified; spec_result/fixed_idx
+        # carry the outcome of the last verification.
+        self.specpipe_len = 0
+        self.spec_result = None
+        self.fixed_idx = None
+        self.flush_len = None
+        self.just_fixed = None
+
+        # specpipe confidence scheduling related
+        self.spec_confidence_list: list[float] = []
+        self.confidence_dropped = False
+        self.stop_dropped = False
+        self.confidence_passed = False
+        self.drop_len = 0
+        self.drop_end = False
+
+        # specpipe special free/premempt logic
+        self.should_preempt = False
+        self.num_scheduled = 0
+
+        # specpipe post-preemption info
+        self.postpreempt_spec_result = None
+        self.postpreempt_fixed_idx = None
+
+        # [Spexis] Per-request speculation counters (diagnostics only).
+        self.total_spec = 0
+        self.spec_success = 0
+        self.spec_fail = 0
+
+        # specpipe length prediction related
+        self.predicted_len_prob = []
+
         # Multi-modal related
         self.mm_positions = multi_modal_placeholders or []
         self.mm_inputs = multi_modal_inputs or []
@@ -94,9 +127,19 @@ class Request:
                 sampling_params=request.sampling_params),
         )
 
+    def spec_confidence(self) -> float:
+        """Joint confidence of the tokens still awaiting verification."""
+        spec_confidence = 1.0
+        for i in range(1, self.specpipe_len + 1):
+            spec_confidence *= self.spec_confidence_list[-i]
+
+        return spec_confidence
+
     def append_output_token_ids(
         self,
         token_ids: Union[int, list[int]],
+        spec_confidence: Optional[float] = None,
+        predicted_len_prob: Optional[list[float]] = None,
     ) -> None:
         if isinstance(token_ids, int):
             self._output_token_ids.append(token_ids)
@@ -104,6 +147,113 @@ class Request:
         else:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
+
+        # [Spexis] Only the speculative append (update_from_spec_output)
+        # supplies a confidence, so this per-token state stays empty on the
+        # vanilla path. It must stay index-aligned with the output tokens:
+        # spec_confidence() reads it back by negative index.
+        if spec_confidence is not None:
+            self.spec_confidence_list.append(spec_confidence)
+            self.predicted_len_prob = predicted_len_prob
+
+    def verify_output_token_ids(
+        self,
+        token_ids: int,
+    ) -> int:
+        '''
+        Verify specpipe spec token. Only supports greedy decoding for now.
+        returns bool (whether spec was right), last_idx for _output_token_ids (0 for True)
+        '''
+        if isinstance(token_ids, int):
+            # Handle Drop # times
+            if self.confidence_dropped == True or self.stop_dropped == True:
+                # handle previous flushed output
+                # maliscious case: flush + drop ...
+                if self.spec_result == False:
+                    self.just_fixed = False
+                    self.flush_len -= 1
+                    if self.flush_len == 0:
+                        self.spec_result = None
+                    return 3
+                
+                self.drop_len -= 1
+                if self.drop_len == 0:
+                    self.stop_dropped = False
+                    self.confidence_dropped = False
+                    if self.spec_result == True or self.spec_result == None:
+                        self._output_token_ids[-1:] = [token_ids]
+                        self._all_token_ids[-1:] = [token_ids]
+                        self.spec_confidence_list[-1:] = [1] # set absolute confidence for target generated fixed tokens
+                        self.drop_end = True
+
+                    self.spec_result = None
+                    self.flush_len = None
+                    self.specpipe_len = 0
+                    self.fixed_idx = 0
+                    return 4
+                
+                # print("Dropping But Verified as normal")
+                
+            # Validate Spec Result (Since token id is valid)
+            if self.spec_result == True or self.spec_result == None:
+                # until now, support greedy decoding only!
+                if self._output_token_ids[-self.specpipe_len] == token_ids:
+                    self.specpipe_len -= 1
+
+                    self.spec_result = True
+                    self.fixed_idx = 0
+                    self.spec_success += 1
+                    self.total_spec += 1
+                    return 0
+                else:
+                    self.num_computed_tokens -= (
+                        self.specpipe_len - 1
+                    )  # at least one token was generate
+                    false_spec_place = len(
+                        self._output_token_ids) - self.specpipe_len
+
+                    self._output_token_ids[-self.specpipe_len:] = [token_ids]
+                    self._all_token_ids[-self.specpipe_len:] = [token_ids]
+
+                    self.spec_confidence_list[-self.specpipe_len:] = [1] # set absolute confidence for target generated fixed tokens
+
+                    self.flush_len = self.specpipe_len - 1
+                    self.specpipe_len = 0
+                    self.just_fixed = True
+                    
+                    # Reset drop flags because previous speculation was wrong -> drop was invalid
+                    self.confidence_dropped = False
+                    self.stop_dropped = False
+                    self.drop_len = 0
+
+                    self.spec_result = False
+                    self.fixed_idx = false_spec_place
+                    # print(f"spec false request: name[{self.request_id}], idx[{self.fixed_idx}]")
+                    self.spec_fail += 1
+                    self.total_spec += 1
+                    return 1
+
+            # Flush token id & Handle Flush # times (Since token id is not valid)
+            else:
+                self.just_fixed = False
+                self.flush_len -= 1
+                if self.flush_len == 0:
+                    self.spec_result = None
+                return 2
+
+        else:
+            assert False, "verify token_ids was list, not int"
+
+    def expect_remain_len_idx(self, threshold_list: list[float]) -> int:
+        # remain length is given in idx, not real length eg. if 4 -> idx 0, 8 -> idx 1 ...
+        remain_length = -1
+
+        for idx in range(len(self.predicted_len_prob)):
+            if self.predicted_len_prob[idx] >= threshold_list[idx]:
+                remain_length = idx
+                return remain_length
+            
+        return remain_length
 
     @property
     def num_tokens(self) -> int:

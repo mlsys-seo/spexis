@@ -1,0 +1,26 @@
+Spexis
+Copyright 2025-2026 Spexis authors
+
+This product includes software developed by the vLLM project
+(https://github.com/vllm-project/vllm), licensed under the Apache
+License, Version 2.0.
+
+Spexis is a fork of vLLM v0.8.4 (commit dc1b4a6f1300003ae27f033afbdff5e2683721ce).
+The following modifications were made to the original software:
+
+  * Added vllm/specpipe/, which implements speculative pipeline
+    parallelism: an early-exit draft model per pipeline stage, a
+    scheduler that overlaps speculation with normal execution and
+    verifies it one iteration later, confidence-based speculation
+    dropping, and lookahead scheduling based on predicted generation
+    length and KV-cache pressure.
+  * Integrated the above into the V1 engine (engine core, scheduler
+    output, request state, GPU model runner and worker, Ray executor).
+    Modified regions in upstream files are marked with "[Spexis]".
+  * Removed support for non-CUDA platforms, models other than the Llama
+    and Qwen families used by the paper, V0 speculative decoding, and
+    the CUDA kernel sources (this fork is Python-only and installs
+    against the prebuilt upstream vLLM v0.8.4 wheel).
+
+Files that are unmodified from vLLM retain their original copyright and
+license headers.

@@ -209,7 +209,8 @@ class RayDistributedExecutor(DistributedExecutorBase):
                 # NV+AMD GPUs, and Intel XPUs
                 worker = ray.remote(
                     num_cpus=0,
-                    num_gpus=num_gpus,
+                    num_gpus=
+                    num_gpus,  # normally 1.0 (one GPU per Ray worker)
                     scheduling_strategy=scheduling_strategy,
                     **ray_remote_kwargs,
                 )(RayWorkerWrapper).remote(vllm_config=self.vllm_config,
@@ -528,12 +529,14 @@ class RayDistributedExecutor(DistributedExecutorBase):
         ray.get(parallel_worker_tasks)
 
     def _check_ray_cgraph_installation(self):
-        import pkg_resources
+        # [Spexis] importlib.metadata instead of pkg_resources: setuptools
+        # >= 81 no longer ships pkg_resources, which crashed this check.
+        from importlib.metadata import version as pkg_version
+
         from packaging import version
 
         required_version = version.parse("2.43.0")
-        current_version = version.parse(
-            pkg_resources.get_distribution("ray").version)
+        current_version = version.parse(pkg_version("ray"))
         if current_version < required_version:
             raise ValueError(f"Ray version {required_version} is "
                              f"required, but found {current_version}")
@@ -623,6 +626,118 @@ class RayDistributedExecutor(DistributedExecutorBase):
                         output.with_tensor_transport(transport=transport)
                         for output in outputs
                     ]
+
+            # NOTE: [Spexis] builds its own DAG in
+            # _compiled_specpipe_ray_dag rather than extending this one.
+
+            forward_dag = MultiOutputNode(outputs)
+
+        return forward_dag.experimental_compile(
+            enable_asyncio=enable_asyncio,
+            _overlap_gpu_communication=envs.
+            VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM)
+
+    def _compiled_specpipe_ray_dag(self, enable_asyncio: bool):
+        assert self.parallel_config.use_ray
+        self._check_ray_cgraph_installation()
+        from ray.dag import InputNode, MultiOutputNode
+
+        logger.info("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE = %s",
+                    envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE)
+        logger.info("VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM = %s",
+                    envs.VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM)
+
+        channel_type = envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE
+        if channel_type not in ("auto", "nccl", "shm"):
+            raise ValueError(
+                "Invalid value for VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: "
+                f"{channel_type}. Valid values are: 'auto', 'nccl', or 'shm'.")
+
+        # Enlarge the default value of "RAY_CGRAPH_get_timeout" to 300 seconds
+        # (it is 10 seconds by default). This is a Ray environment variable to
+        # control the timeout of getting result from a compiled graph execution,
+        # i.e., the distributed execution that includes model forward runs and
+        # intermediate tensor communications, in the case of vllm.
+        os.environ.setdefault("RAY_CGRAPH_get_timeout", "300")  # noqa: SIM112
+        logger.info("RAY_CGRAPH_get_timeout is set to %s",
+                    os.environ["RAY_CGRAPH_get_timeout"])  # noqa: SIM112
+
+        with InputNode() as input_data:
+            # Example DAG: PP=2, TP=4
+            #
+            # For V0:
+            # ExecuteModelRequest -> 0 -> (ExecuteModelReq, IntermediateTensors) -> 4 -> SamplerOutput   # noqa: E501
+            # ExecuteModelRequest -> 1 -> (ExecuteModelReq, IntermediateTensors) -> 5 -> SamplerOutput   # noqa: E501
+            # ExecuteModelRequest -> 2 -> (ExecuteModelReq, IntermediateTensors) -> 6 -> SamplerOutput   # noqa: E501
+            # ExecuteModelRequest -> 3 -> (ExecuteModelReq, IntermediateTensors) -> 7 -> SamplerOutput   # noqa: E501
+            #
+            # For V1:
+            # SchedulerOutput -> 0 -> (SchedulerOutput, IntermediateTensors) -> 4 -> ModelRunnerOutput   # noqa: E501
+            # SchedulerOutput -> 1 -> (SchedulerOutput, IntermediateTensors) -> 5 -> ModelRunnerOutput   # noqa: E501
+            # SchedulerOutput -> 2 -> (SchedulerOutput, IntermediateTensors) -> 6 -> ModelRunnerOutput   # noqa: E501
+            # SchedulerOutput -> 3 -> (SchedulerOutput, IntermediateTensors) -> 7 -> ModelRunnerOutput   # noqa: E501
+
+            # All workers in the first TP group will take in the
+            # ExecuteModelRequest as input.
+            outputs = [input_data for _ in self.pp_tp_workers[0]]
+
+            tokens = [
+                worker.execute_target_model_ray.
+                bind(  # type: ignore[attr-defined]
+                    outputs[i]) for i, worker in enumerate(self.pp_tp_workers[0])
+            ]
+
+            outputs = [
+                worker.execute_return_hidden_ray.
+                bind(
+                    tokens[i]) for i, worker in enumerate(self.pp_tp_workers[0])
+            ]
+
+            transport = envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE
+            outputs = [
+                output.with_tensor_transport(transport=transport)
+                for output in outputs
+            ]
+
+            exit_model_outputs = [
+                worker.execute_specpipe_model_ray.
+                bind(  # type: ignore[attr-defined]
+                    tokens[i])
+                for i, worker in enumerate(self.pp_tp_workers[0])
+            ]
+
+            for pp_rank, tp_group in enumerate(self.pp_tp_workers[1:]):
+                # Each PP worker takes in the output of the previous PP worker,
+                # and the TP group executes in SPMD fashion.
+                if self.use_v1:
+                    outputs = [
+                        worker.execute_model_ray.
+                        bind(  # type: ignore[attr-defined]
+                            outputs[i]) for i, worker in enumerate(tp_group)
+                    ]
+
+                else:
+                    assert False, 'specpipe do not support V0'
+                    outputs = [
+                        worker.execute_model_spmd.
+                        bind(  # type: ignore[attr-defined]
+                            outputs[i]) for i, worker in enumerate(tp_group)
+                    ]
+
+                last_pp_rank = len(self.pp_tp_workers) - 1
+                if (pp_rank + 1 < last_pp_rank and
+                        envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE != "shm"):
+                    # Specify how intermediate tensors should be passed
+                    # between pp stages, no need to specify for the last
+                    # pp stage or when using shared memory (the default).
+                    transport = envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE
+                    outputs = [
+                        output.with_tensor_transport(transport=transport)
+                        for output in outputs
+                    ]
+
+            if self.specpipe_config.enable_specpipe:
+                outputs = outputs + exit_model_outputs
 
             forward_dag = MultiOutputNode(outputs)
 

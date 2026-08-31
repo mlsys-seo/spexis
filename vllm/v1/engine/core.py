@@ -10,16 +10,23 @@ from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
 
+import torch
+
 import msgspec
 import psutil
 import zmq
 import zmq.asyncio
+
+import pickle
+from multiprocessing import shared_memory
+import numpy as np
 
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.executor.multiproc_worker_utils import _add_prefix
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.specpipe.specpipe_scheduler import SpecPipeScheduler
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value)
 from vllm.utils import (get_exception_traceback, resolve_obj_by_qualname,
@@ -39,6 +46,12 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
+
+from vllm.specpipe.handle_inputbatch import (CPUInputBatch,
+                                             total_embedding_process)
+from vllm.specpipe.iteration_log import IterationLogger
+from vllm.specpipe.shm import (FLAG_SIZE, HEADER_SIZE, MAX_SIZE, SHM_NAME,
+                               read_result_from_shm)
 
 logger = init_logger(__name__)
 
@@ -62,6 +75,16 @@ class EngineCore:
                     VLLM_VERSION, vllm_config)
 
         self.log_stats = log_stats
+        # Per-iteration metrics log consumed by exp_utils/log_iter.
+        self.iter_logger = IterationLogger(
+            vllm_config.specpipe_config.logdir,
+            enabled=vllm_config.specpipe_config.enable_log)
+
+        self.enable_specpipe = vllm_config.specpipe_config.enable_specpipe
+        self.spec_output_shm = None
+        if self.enable_specpipe:
+            self._init_specpipe_state(vllm_config)
+
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -82,6 +105,9 @@ class EngineCore:
         else:
             Scheduler = vllm_config.scheduler_config.scheduler_cls
 
+        if vllm_config.specpipe_config.enable_specpipe:
+            Scheduler = SpecPipeScheduler
+
         # This warning can be removed once the V1 Scheduler interface is
         # finalized and we can maintain support for scheduler classes that
         # implement it
@@ -92,18 +118,33 @@ class EngineCore:
                 "compatibility may not be maintained.",
                 vllm_config.scheduler_config.scheduler_cls)
 
-        self.scheduler: SchedulerInterface = Scheduler(
-            scheduler_config=vllm_config.scheduler_config,
-            model_config=vllm_config.model_config,
-            cache_config=vllm_config.cache_config,
-            lora_config=vllm_config.lora_config,
-            kv_cache_config=kv_cache_config,
-            speculative_config=vllm_config.speculative_config,
-            structured_output_manager=self.structured_output_manager,
-            include_finished_set=vllm_config.parallel_config.data_parallel_size
-            > 1,
-            log_stats=self.log_stats,
-        )
+        if not vllm_config.specpipe_config.enable_specpipe:
+            self.scheduler: SchedulerInterface = Scheduler(
+                scheduler_config=vllm_config.scheduler_config,
+                model_config=vllm_config.model_config,
+                cache_config=vllm_config.cache_config,
+                lora_config=vllm_config.lora_config,
+                kv_cache_config=kv_cache_config,
+                speculative_config=vllm_config.speculative_config,
+                structured_output_manager=self.structured_output_manager,
+                include_finished_set=vllm_config.parallel_config.
+                data_parallel_size > 1,
+                log_stats=self.log_stats,
+            )
+        else:
+            self.scheduler: SchedulerInterface = Scheduler(
+                scheduler_config=vllm_config.scheduler_config,
+                model_config=vllm_config.model_config,
+                cache_config=vllm_config.cache_config,
+                lora_config=vllm_config.lora_config,
+                kv_cache_config=kv_cache_config,
+                speculative_config=vllm_config.speculative_config,
+                structured_output_manager=self.structured_output_manager,
+                include_finished_set=vllm_config.parallel_config.
+                data_parallel_size > 1,
+                log_stats=self.log_stats,
+                parallel_config=vllm_config.parallel_config,
+                specpipe_config=vllm_config.specpipe_config)
 
         # Setup MM Input Mapper.
         self.mm_input_cache_server = MirroredProcessingCache(
@@ -116,10 +157,20 @@ class EngineCore:
         self.batch_queue_size = self.model_executor.max_concurrent_batches
         self.batch_queue: Optional[queue.Queue[tuple[Future[ModelRunnerOutput],
                                                      SchedulerOutput]]] = None
+
+        # [Spexis] Speculation runs one pipeline iteration behind its
+        # verification, so the in-flight batches are tracked separately.
+        self.batch_queue_for_spec: Optional[queue.Queue[tuple[
+            Future[ModelRunnerOutput], SchedulerOutput]]] = None
         if self.batch_queue_size > 1:
             logger.info("Batch queue is enabled with size %d",
                         self.batch_queue_size)
             self.batch_queue = queue.Queue(self.batch_queue_size)
+
+            if self.enable_specpipe:
+                self.batch_queue_for_spec = queue.Queue(self.batch_queue_size)
+                for _ in range(self.batch_queue_size):
+                    self.batch_queue_for_spec.put(None)
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -195,20 +246,21 @@ class EngineCore:
 
     def step(self) -> EngineCoreOutputs:
         """Schedule, execute, and make output."""
+        with self.iter_logger.record() as rec:
+            # Check for any requests remaining in the scheduler - unfinished,
+            # or finished and not yet removed from the batch.
+            if not self.scheduler.has_requests():
+                return EngineCoreOutputs(
+                    outputs=[],
+                    scheduler_stats=self.scheduler.make_stats(),
+                )
 
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
-        if not self.scheduler.has_requests():
-            return EngineCoreOutputs(
-                outputs=[],
-                scheduler_stats=self.scheduler.make_stats(),
-            )
-        scheduler_output = self.scheduler.schedule()
-        output = self.model_executor.execute_model(scheduler_output)
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, output)  # type: ignore
+            scheduler_output = self.scheduler.schedule()
+            rec.set_schedule(scheduler_output)
 
-        return engine_core_outputs
+            output = self.model_executor.execute_model(scheduler_output)
+            return self.scheduler.update_from_output(
+                scheduler_output, output)  # type: ignore
 
     def step_with_batch_queue(self) -> Optional[EngineCoreOutputs]:
         """Schedule and execute batches with the batch queue.
@@ -225,36 +277,150 @@ class EngineCore:
         3. Update the scheduler from the output.
         """
         assert self.batch_queue is not None
-
         engine_core_outputs = None
         scheduler_output = None
-        # If there are unscheduled requests and the job queue
-        # is not full, schedule a new batch. Note that this is not blocking.
-        if (self.scheduler.get_num_unscheduled_requests() > 0
-                and not self.batch_queue.full()):
-            scheduler_output = self.scheduler.schedule()
-            if scheduler_output.total_num_scheduled_tokens > 0:
-                future = self.model_executor.execute_model(scheduler_output)
-                self.batch_queue.put_nowait(
-                    (future, scheduler_output))  # type: ignore
 
-        scheduled_batch = (scheduler_output is not None
-                           and scheduler_output.total_num_scheduled_tokens > 0)
+        with self.iter_logger.record() as rec:
+            # If there are unscheduled requests and the job queue
+            # is not full, schedule a new batch. Note that this is not
+            # blocking.
+            if (self.scheduler.get_num_unscheduled_requests() > 0
+                    and not self.batch_queue.full()):
+                scheduler_output = self.scheduler.schedule()
+                rec.set_schedule(scheduler_output)
+                if scheduler_output.total_num_scheduled_tokens > 0:
+                    future = self.model_executor.execute_model(
+                        scheduler_output)
+                    self.batch_queue.put_nowait(
+                        (future, scheduler_output))  # type: ignore
 
-        # If no more requests can be scheduled and the job queue is not empty,
-        # block until the first batch in the job queue is finished.
-        if not scheduled_batch and not self.batch_queue.empty():
-            future, scheduler_output = self.batch_queue.get_nowait()
-            # Blocking until the first result is available.
-            model_output = future.result()
-            self.batch_queue.task_done()
-            engine_core_outputs = self.scheduler.update_from_output(
-                scheduler_output, model_output)
+            scheduled_batch = (scheduler_output is not None and
+                               scheduler_output.total_num_scheduled_tokens > 0)
+
+            # If no more requests can be scheduled and the job queue is not
+            # empty, block until the first batch in the job queue is finished.
+            if not scheduled_batch and not self.batch_queue.empty():
+                future, scheduler_output = self.batch_queue.get_nowait()
+                # Blocking until the first result is available.
+                model_output = future.result()
+                self.batch_queue.task_done()
+                engine_core_outputs = self.scheduler.update_from_output(
+                    scheduler_output, model_output)
 
         return engine_core_outputs
 
+    def step_with_specpipe(self) -> Optional[EngineCoreOutputs]:
+        """Schedule and execute batches dynamically within spec | ubatch.
+        [Spexis] Runs speculation one pipeline iteration ahead of the
+        verification that confirms it.
+        """
+        assert self.batch_queue_for_spec is not None
+
+        torch.cuda.nvtx.range_push(msg="core step")
+        true_engine_core_outputs = None
+
+        with self.iter_logger.record() as rec:
+            # Step 1 - verify the previous pipeline iteration's speculation
+            # against the target-model output it was racing.
+            # NOTE: this assumes the previous iteration's true output is
+            # ready; pipeline bubbles are not modelled here.
+            if not self.batch_queue_for_spec.empty():
+                previous_iter = self.batch_queue_for_spec.get_nowait()
+                if previous_iter is not None:
+                    true_output_future, prev_scheduler_output = previous_iter
+                    true_model_output = true_output_future.result()
+                    (true_engine_core_outputs, *spec_counts) = \
+                        self.scheduler.update_from_true_output(
+                            prev_scheduler_output, true_model_output)
+                    rec.set_spec_results(spec_counts)
+
+            # Step 2 - schedule
+            (scheduler_output, resume_helper, max_dropped_confidence,
+             len_estimate_time) = self.scheduler.schedule()
+            rec["len_estimate_s"] = len_estimate_time
+
+            if scheduler_output.total_num_scheduled_tokens > 0:
+                # Step 3.0 - look up input embeddings on the CPU
+                total_embedding_process(scheduler_output, self.input_batch,
+                                        self.embed_tokens, rec, resume_helper)
+
+                # Step 3.1 - launch target model and exit layer
+                rec.set_schedule(scheduler_output)
+                rec["max_dropped_confidence"] = max_dropped_confidence
+
+                (true_output_future, spec_output_future
+                 ) = self.model_executor.execute_specpipe_model(
+                     scheduler_output)
+
+                self.batch_queue_for_spec.put_nowait(
+                    (true_output_future, scheduler_output))  # type: ignore
+
+                # Step 4 - ingest the speculative output, which the stage-0
+                # worker publishes out-of-band through shared memory.
+                assert spec_output_future is not None, (
+                    "scheduled tokens but no speculative output future")
+                raw_data = read_result_from_shm(self.np_shm_buffer)
+                model_spec_output = pickle.loads(raw_data)
+                self.scheduler.update_from_spec_output(scheduler_output,
+                                                       model_spec_output)
+            else:
+                self.batch_queue_for_spec.put_nowait(None)
+
+        torch.cuda.nvtx.range_pop()
+
+        return true_engine_core_outputs
+
+    def _init_specpipe_state(self, vllm_config: VllmConfig) -> None:
+        """Set up the shared-memory channel and the CPU embedding table.
+
+        The stage-0 worker publishes exit-layer output through a shared
+        memory segment (see vllm/specpipe/shm.py); the segment is created
+        here, before the workers attach to it. The first pipeline stage has
+        no GPU embedding table under specpipe, so the token embeddings are
+        loaded here and pinned for fast host-to-device transfer.
+        """
+        # A stale segment can survive a crashed run; drop it first.
+        try:
+            stale_shm = shared_memory.SharedMemory(name=SHM_NAME)
+            stale_shm.close()
+            stale_shm.unlink()
+        except FileNotFoundError:
+            pass
+        self.spec_output_shm = shared_memory.SharedMemory(name=SHM_NAME,
+                                                          create=True,
+                                                          size=MAX_SIZE)
+        self.np_shm_buffer = np.ndarray((MAX_SIZE, ),
+                                        dtype=np.uint8,
+                                        buffer=self.spec_output_shm.buf)
+        zero = np.array([0], dtype=np.int32).view(np.uint8)
+        self.np_shm_buffer[0:FLAG_SIZE] = zero
+        self.np_shm_buffer[FLAG_SIZE:FLAG_SIZE + HEADER_SIZE] = zero
+        logger.info("Initialized specpipe shared memory segment %s (%d bytes)",
+                    SHM_NAME, MAX_SIZE)
+
+        # Checkpoint holding just the target model's embedding weights; see
+        # the exit-model artifacts in the README.
+        weights = torch.load(vllm_config.specpipe_config.cpu_embedding_path,
+                             map_location="cpu")
+        embed_tokens = weights["embed_tokens.weight"].cpu()
+        # Match the model dtype and pin so the per-iteration lookup can be
+        # copied to the device without an extra staging buffer.
+        self.embed_tokens = embed_tokens.to(
+            dtype=vllm_config.model_config.dtype).contiguous().pin_memory()
+
+        self.input_batch = CPUInputBatch(
+            vllm_config.scheduler_config.max_num_seqs)
+
     def shutdown(self):
         self.model_executor.shutdown()
+        self.iter_logger.close()
+        if self.spec_output_shm is not None:
+            self.spec_output_shm.close()
+            try:
+                self.spec_output_shm.unlink()
+            except FileNotFoundError:
+                pass
+            self.spec_output_shm = None
 
     def profile(self, is_start: bool = True):
         self.model_executor.profile(is_start)
@@ -319,8 +485,13 @@ class EngineCoreProc(EngineCore):
     ):
         super().__init__(vllm_config, executor_class, log_stats)
 
-        self.step_fn = (self.step if self.batch_queue is None else
-                        self.step_with_batch_queue)
+        # [Spexis] speculative pipelining drives its own step function.
+        if vllm_config.specpipe_config.enable_specpipe:
+            self.step_fn = self.step_with_specpipe
+        elif self.batch_queue is None:
+            self.step_fn = self.step
+        else:
+            self.step_fn = self.step_with_batch_queue
 
         self.global_unfinished_reqs = False
 

@@ -88,6 +88,11 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
+    # Latency divided by the number of generated tokens.
+    mean_normalized_latency_ms: float
+    median_normalized_latency_ms: float
+    std_normalized_latency_ms: float
+    percentiles_normalized_latency_ms: list[tuple[float, float]]
 
 
 async def get_request(
@@ -152,6 +157,7 @@ def calculate_metrics(
     all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
+    normalized_latencies: list[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -177,6 +183,8 @@ def calculate_metrics(
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
+            if output_len > 0:
+                normalized_latencies.append(outputs[i].latency / output_len)
             completed += 1
         else:
             actual_output_lens.append(0)
@@ -237,6 +245,14 @@ def calculate_metrics(
         median_e2el_ms=np.median(e2els or 0) * 1000,
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
+        mean_normalized_latency_ms=np.mean(normalized_latencies or 0) * 1000,
+        median_normalized_latency_ms=np.median(normalized_latencies or 0) *
+        1000,
+        std_normalized_latency_ms=np.std(normalized_latencies or 0) * 1000,
+        percentiles_normalized_latency_ms=[
+            (p, np.percentile(normalized_latencies or 0, p) * 1000)
+            for p in selected_percentiles
+        ],
     )
 
     return metrics, actual_output_lens
@@ -262,6 +278,7 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
+    max_duration: Optional[int] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -351,6 +368,11 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate, burstiness):
+
+        if max_duration is not None and time.perf_counter() - benchmark_start_time > max_duration:
+            print(f"[INFO] Time limit ({max_duration}s) reached, stop generating new requests.")
+            break
+
         prompt, prompt_len, output_len, mm_content = request.prompt, \
             request.prompt_len, request.expected_output_len, \
                 request.multi_modal_data
@@ -476,6 +498,9 @@ async def benchmark(
                        "Time per Output Token (excl. 1st token)")
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
+    process_one_metric(
+        "normalized_latency", "Normalized Latency",
+        "Normalized Latency (E2E Latency / Output Tokens)")
 
     print("=" * 50)
 
@@ -704,6 +729,7 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
+            max_duration=args.max_duration,
         ))
 
     # Save config and results to json
@@ -920,11 +946,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--percentile-metrics",
         type=str,
-        default="ttft,tpot,itl",
+        default="ttft,tpot,itl,e2el,normalized_latency",
         help="Comma-separated list of selected metrics to report percentils. "
         "This argument specifies the metrics to report percentiles. "
-        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\". "
-        "Default value is \"ttft,tpot,itl\".")
+        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\", "
+        "\"normalized_latency\". "
+        "Default value is \"ttft,tpot,itl,e2el,normalized_latency\".")
     parser.add_argument(
         "--metric-percentiles",
         type=str,
@@ -1082,6 +1109,16 @@ if __name__ == "__main__":
                         help="A subset of LoRA module names passed in when "
                         "launching the server. For each request, the "
                         "script chooses a LoRA module at random.")
+
+    parser.add_argument(
+        "--max-duration",
+        type=int,
+        default=None,
+        help="Maximum duration (in seconds) to send new requests. "
+             "After this time, no new requests will be issued, "
+             "but ongoing requests will still complete."
+    )
+
 
     args = parser.parse_args()
 

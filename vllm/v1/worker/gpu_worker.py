@@ -117,7 +117,12 @@ class Worker(WorkerBase):
         set_random_seed(self.model_config.seed)
 
         # Construct the model runner
-        self.model_runner: GPUModelRunner = GPUModelRunner(
+        # [Spexis] speculative pipelining needs the exit-layer runner.
+        runner_cls: type[GPUModelRunner] = GPUModelRunner
+        if self.vllm_config.specpipe_config.enable_specpipe:
+            from vllm.specpipe.gpu_model_runner import SpecpipeGPUModelRunner
+            runner_cls = SpecpipeGPUModelRunner
+        self.model_runner: GPUModelRunner = runner_cls(
             self.vllm_config, self.device)
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool

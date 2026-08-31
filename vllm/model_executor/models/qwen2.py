@@ -290,7 +290,7 @@ class Qwen2Model(nn.Module):
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
 
-        if get_pp_group().is_first_rank or (config.tie_word_embeddings
+        if not vllm_config.specpipe_config.enable_specpipe and get_pp_group().is_first_rank or (config.tie_word_embeddings
                                             and get_pp_group().is_last_rank):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,

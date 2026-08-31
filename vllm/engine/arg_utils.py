@@ -10,6 +10,7 @@ from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional,
                     Tuple, Type, Union, cast, get_args, get_origin)
 
 import torch
+import os
 
 import vllm.envs as envs
 from vllm import version
@@ -18,8 +19,9 @@ from vllm.config import (CacheConfig, CompilationConfig, ConfigFormat,
                          KVTransferConfig, LoadConfig, LoadFormat, LoRAConfig,
                          ModelConfig, ModelImpl, ObservabilityConfig,
                          ParallelConfig, PoolerConfig, PromptAdapterConfig,
-                         SchedulerConfig, SpeculativeConfig, TaskOption,
-                         TokenizerPoolConfig, VllmConfig, get_attr_docs)
+                         SchedulerConfig, SpecPipeConfig, SpeculativeConfig,
+                         TaskOption, TokenizerPoolConfig, VllmConfig,
+                         get_attr_docs)
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
@@ -46,6 +48,17 @@ DEVICE_OPTIONS = [
     "xpu",
     "hpu",
 ]
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
 def nullable_str(val: str):
@@ -216,6 +229,20 @@ class EngineArgs:
     enable_reasoning: Optional[bool] = None
     reasoning_parser: Optional[str] = None
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
+
+    # [Spexis] speculative pipelining options
+    enable_specpipe: bool = False
+    sppp_ver: str = None #spepcpipe version 1.0 1.5 2.0 2.5
+    exit_layer: Optional[List[bool]] = None  # len = p.p.
+    exit_models: Optional[List[str]] = None  # len = p.p.
+    cpu_embedding_path: str = None  # path to cpu embedding weights
+    length_predictor_path: str = None  # path to length predictor weights
+    verify_strategy: Optional[str] = None  # greedy or sampling
+    confidence_threshold: Optional[float] = None # 0~1 for dynamic scheduling
+    drop_ratio: Optional[float] = None # 0~1 for dynamic scheduling
+    exit_model_type: Optional[str] = None
+    enable_log: bool = False
+    logdir: Optional[str] = None
 
     def __post_init__(self):
         if not self.tokenizer:
@@ -1017,6 +1044,106 @@ class EngineArgs:
             "scheduled (like TTTTIIIII, leaving IIIII), it will be scheduled "
             "as TTTT in one step and IIIIIIIIII in the next.")
 
+        # [Spexis] specpipe arguments
+        parser.add_argument('--enable-specpipe',
+                            type=str2bool,
+                            default=False,
+                            help='whether use specpipe')
+
+        # List[bool] from command line
+        parser.add_argument(
+            '--exit-layer',
+            type=str2bool,
+            nargs='+',
+            default=None,
+            help='List of enabled exit layers (e.g. --exit_layer t t f f)')
+
+        # List[str] from command line
+        parser.add_argument(
+            '--exit-models',
+            type=str,
+            nargs='+',
+            default=None,
+            help= \
+            'List of adapter model paths (e.g. --exit_models model1.pt model2.pt None None)'
+        )
+
+        # str from command line
+        parser.add_argument(
+            '--cpu-embedding-path',
+            type=str,
+            default=None, 
+            help= \
+            'Path to CPU embedding weights (e.g. --cpu-embedding-path emb_tokens.bin)'
+        )
+
+        # str from command line
+        parser.add_argument(
+            '--length-predictor-path',
+            type=str,
+            default=None, 
+            help= \
+            'Path to length predictor weights (e.g. --length-predictor-path /models/target_model_name/exit_1_2/)'
+        )
+
+        parser.add_argument(
+            '--sppp-ver',
+            type=str,
+            choices=['0.0', '1.0', '1.5', '2.0', '2.5'],
+            default=None,
+            help = \
+            'Version of specpipe: 0.0(no sppp), 1.0(base sppp), 1.5(sppp+drop), 2.0(sppp+drop+lengthpred), 2.5(sppp+drop+lengthpred+addacc)'
+        )
+
+        # Single string, choice of strategies
+        parser.add_argument(
+            '--verify-strategy',
+            type=str,
+            choices=['greedy', 'sampling'],
+            help= \
+            'verify strategy of specpipe. It should be either greedy or sampling'
+        )
+
+        parser.add_argument(
+            '--confidence-threshold',
+            type=float,
+            default=None,
+            help= \
+            'Confidence Threshold for Dynamic scheduling'
+        )
+
+        parser.add_argument(
+            '--drop-ratio',
+            type=float,
+            default=None,
+            help= \
+            'Drop Ratio for Dynamic scheduling'
+        )
+
+        parser.add_argument(
+            '--exit-model-type',
+            type=str,
+            default=None,
+            help= \
+            'The type of exitmodel to use'
+        )
+
+        parser.add_argument(
+            '--enable-log',
+            type=str2bool,
+            default=False,
+            help= \
+            'Whether to enable log'
+        )
+
+        parser.add_argument(
+            '--logdir',
+            type=str,
+            default=None,
+            help= \
+            'The output dirctory of logging'
+        )
+
         return parser
 
     @classmethod
@@ -1229,6 +1356,23 @@ class EngineArgs:
             disable_log_stats=self.disable_log_stats,
         )
 
+        # [Spexis]
+        specpipe_config = SpecPipeConfig(
+            enable_specpipe=self.enable_specpipe,
+            sppp_ver=self.sppp_ver,
+            target_model_config=model_config,
+            exit_layer=self.exit_layer,
+            exit_models=self.exit_models,
+            cpu_embedding_path=self.cpu_embedding_path,
+            length_predictor_path=self.length_predictor_path,
+            verify_strategy=self.verify_strategy,
+            confidence_threshold=self.confidence_threshold,
+            drop_ratio=self.drop_ratio,
+            exit_model_type=self.exit_model_type,
+            enable_log=self.enable_log,
+            logdir=self.logdir,
+        )
+
         # Reminder: Please update docs/source/features/compatibility_matrix.md
         # If the feature combo become valid
         if self.num_scheduler_steps > 1:
@@ -1340,6 +1484,7 @@ class EngineArgs:
             device_config=device_config,
             lora_config=lora_config,
             speculative_config=speculative_config,
+            specpipe_config=specpipe_config,
             load_config=load_config,
             decoding_config=decoding_config,
             observability_config=observability_config,

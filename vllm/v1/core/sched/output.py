@@ -61,6 +61,12 @@ class CachedRequestData:
     new_block_ids: list[int]
     num_computed_tokens: int
 
+    # [Spexis] Speculation state carried to the worker: False marks a
+    # rejected speculation, and fixed_idx points at the corrected token.
+    # Defaulted so non-specpipe scheduling is unaffected.
+    spec_result: bool = True
+    fixed_idx: int = -1
+
     @classmethod
     def from_request(
         cls,

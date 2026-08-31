@@ -176,6 +176,8 @@ async def run_vllm_async(
             lora_requests.append(request.lora_request)
 
         generators = []
+
+        torch.cuda.nvtx.range_push(msg="async_generate")
         start = time.perf_counter()
         for i, (prompt, sp,
                 lr) in enumerate(zip(prompts, sampling_params, lora_requests)):
@@ -188,6 +190,8 @@ async def run_vllm_async(
         async for i, res in all_gens:
             pass
         end = time.perf_counter()
+
+        torch.cuda.nvtx.range_pop()
         return end - start
 
 

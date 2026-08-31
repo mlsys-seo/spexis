@@ -74,6 +74,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
+        # [Spexis] see vllm/specpipe/gpu_model_runner.py for the
+        # speculative-pipeline subclass that overrides the input path.
+        self.specpipe_config = vllm_config.specpipe_config
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
@@ -318,6 +321,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
         # sets of requests), this optimization becomes very inefficient.
+
         for req_id in unscheduled_req_ids:
             req_index = self.input_batch.remove_request(req_id)
             assert req_index is not None
@@ -381,7 +385,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the states of the running/resumed requests.
         for req_data in scheduler_output.scheduled_cached_reqs:
             req_id = req_data.req_id
-            req_state = self.requests[req_id]
+            req_state = self.requests[req_id]  # type: CachedRequestState
 
             # Update the cached states.
             num_computed_tokens = req_data.num_computed_tokens
@@ -986,15 +990,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             indices=list(struct_out_req_batch_indices.values()),
         )
 
+    # [Spexis] hooks overridden by SpecpipeGPUModelRunner; the base class
+    # keeps them as no-ops so the vanilla path is unchanged.
+    enable_specpipe = False
+
+    def _load_specpipe_models(self) -> None:
+        """Load speculative-pipeline submodels (exit layer, predictor)."""
+        return None
+
+    def _profile_specpipe_run(self):
+        """Dummy-run the exit layer during profiling."""
+        return None, None
+
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, torch.Tensor]:
+        torch.cuda.nvtx.range_push(msg="execute_model")
         self._update_states(scheduler_output)
+
         if not scheduler_output.total_num_scheduled_tokens:
             # Return empty ModelRunnerOutput if there's no work to do.
+            torch.cuda.nvtx.range_pop()
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         if self.is_multimodal_model:
@@ -1007,6 +1026,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Prepare the decoder inputs.
         attn_metadata, logits_indices, spec_decode_metadata = (
             self._prepare_inputs(scheduler_output))
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if (self.use_cuda_graph
                 and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
@@ -1069,6 +1089,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         if not get_pp_group().is_last_rank:
             # For mid-pipeline stages, return the hidden states.
+            torch.cuda.nvtx.range_pop()
             return hidden_states
 
         hidden_states = hidden_states[:num_scheduled_tokens]
@@ -1230,7 +1251,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # TODO(woosuk): Cache draft_probs and use it for rejection sampling
             # in the next step.
             del draft_probs
-
+        torch.cuda.nvtx.range_pop()
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -1239,6 +1260,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
         )
+
+
+
+
 
     def generate_draft_token_ids(
         self,
@@ -1286,6 +1311,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self, "drafter"):
                 logger.info("Loading drafter model...")
                 self.drafter.load_model(self.model)
+
+            # [Spexis] load the exit layer inside the profiler block so
+            # model_memory_usage covers it too (no-op without specpipe).
+            self._load_specpipe_models()
+
             time_after_load = time.perf_counter()
         self.model_memory_usage = m.consumed_memory
         logger.info("Model loading took %.4f GiB and %.6f seconds",
@@ -1416,6 +1446,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 input_ids = self.input_ids[:num_tokens]
                 inputs_embeds = None
+                if self.enable_specpipe and get_pp_group().is_first_rank:
+                    # [Spexis] the first stage is fed CPU-computed
+                    # embeddings rather than token ids.
+                    inputs_embeds = self.inputs_embeds[:num_tokens]
             if self.uses_mrope:
                 positions = self.mrope_positions[:, :num_tokens]
             else:
@@ -1438,7 +1472,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             with set_forward_context(None,
                                      self.vllm_config,
                                      num_tokens=num_tokens):
-                hidden_states = model(
+                hidden_states = model(  # [total_tokens_in_batch, hidden]
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
@@ -1446,7 +1480,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        return hidden_states[logit_indices]
+        return hidden_states[logit_indices]  # [batch_size, hidden]
+
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -1593,8 +1628,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampler_output = self._dummy_sampler_run(hidden_states)
         else:
             sampler_output = None
+
+        # [Spexis] profile the exit layer here as well so KV-cache sizing
+        # accounts for it (no-op without specpipe).
+        sp_hidden_states, sp_sampler_output = self._profile_specpipe_run()
+
         torch.cuda.synchronize()
-        del hidden_states, sampler_output
+        del hidden_states, sampler_output, sp_hidden_states, sp_sampler_output
         self.encoder_cache.clear()
         gc.collect()
 
@@ -1611,6 +1651,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
+
         with graph_capture(device=self.device):
             for num_tokens in reversed(self.cudagraph_batch_sizes):
                 for _ in range(self.vllm_config.compilation_config.
@@ -1682,6 +1723,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """
 
         forward_ctx = self.vllm_config.compilation_config.static_forward_context
+
         block_size = self.vllm_config.cache_config.block_size
         use_mla = self.vllm_config.model_config.use_mla
         kv_cache_spec: dict[str, KVCacheSpec] = {}

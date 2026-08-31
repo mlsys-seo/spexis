@@ -2023,6 +2023,149 @@ class DeviceConfig:
 
 
 @dataclass
+class SpecPipeConfig:
+    """[Spexis] Configuration for speculative pipeline parallelism."""
+    enable_specpipe: bool = False
+    sppp_ver: str = None
+    target_model_config: ModelConfig = None
+    exit_layer: list[int] = None
+    exit_models: list[str] = None
+    cpu_embedding_path: str = None
+    length_predictor_path: str = None
+    verify_strategy: str = None
+    confidence_threshold: float = None
+    drop_ratio: float = None
+    exit_model_type: str = None
+    enable_log: bool = False
+    logdir: str = None
+
+    # --- Scheduler tuning knobs (defaults reproduce the paper setup) ---
+    # Confidence-based spec drop (sppp >= 1.5): number of confidence
+    # histogram buckets used for the per-iteration drop selection.
+    confidence_buckets: int = 20
+    # Short-request extra acceleration (sppp 2.5).
+    max_add_reqs: int = 16
+    add_acc_lenidx_thre: int = 0
+    add_acc_conf_thre: float = 0.5
+    # Lookahead length/memory estimation (sppp >= 2.0).
+    mem_esti_bar: float = 0.7
+    mem_estimate_margin: float = 0.95
+    average_spec_acc: float = 0.8
+    max_estimate_iter: int = 64
+    estimate_iter_stride: int = 4
+    # KV blocks reserved as fragmentation headroom when projecting memory.
+    prefill_reserve_blocks: int = 512
+    expect_length: list[int] = None
+    lenprob_threshold: list[float] = None
+    # Per-threshold precision of the length predictor, calibrated on
+    # UltraChat; re-calibrate when the predictor is retrained.
+    lenesti_prec: list[float] = None
+ 
+    def __post_init__(self):
+        self.sppp_len_pred = False
+        if self.expect_length is None:
+            self.expect_length = [4, 8, 16, 32, 64]
+        if self.lenprob_threshold is None:
+            self.lenprob_threshold = [0.5] * len(self.expect_length)
+        if self.lenesti_prec is None:
+            self.lenesti_prec = [0.727, 0.7423, 0.7709, 0.7909, 0.8164]
+        if self.enable_specpipe:
+            self.pp_size = len(self.exit_layer)
+            logger.info("SpecPipe Inference Activated!!")
+            assert len(self.exit_layer) == len(
+                self.exit_models
+            ), "specpipe exitlayer model config does not match - list len diff"
+
+            for i in range(self.pp_size):
+                if not self.exit_layer[i]:
+                    assert self.exit_models[
+                        i] is not None, f"you specified model \"{self.exit_models[i]}\" for pp node[{i}], \
+                                    but pp node[{i}] is not activated for specpipe"
+
+            if self.verify_strategy not in ["greedy", "sampling"]:
+                assert False, f"verify strategy should be greedy / sampling. \
+                                You typed {self.verify_strategy}"
+
+            self.exit_hf_config = []
+            self.exit_model_config = []
+
+            for exit_model in self.exit_models:
+                if exit_model == "None" or exit_model == "none":
+                    self.exit_hf_config.append(None)
+                    self.exit_model_config.append(None)
+                else:
+                    hf_config = get_config(exit_model, False, None, None,
+                                           ConfigFormat.AUTO)
+                    self.exit_hf_config.append(hf_config)
+
+                    exit_model_config = ModelConfig(
+                        model=exit_model,
+                        task="draft",
+                        tokenizer=self.target_model_config.tokenizer,
+                        tokenizer_mode=self.target_model_config.tokenizer_mode,
+                        trust_remote_code=self.target_model_config.
+                        trust_remote_code,
+                        allowed_local_media_path=self.target_model_config.
+                        allowed_local_media_path,
+                        dtype=self.target_model_config.dtype,
+                        seed=self.target_model_config.seed,
+                        revision=self.target_model_config.revision,
+                        code_revision=self.target_model_config.code_revision,
+                        tokenizer_revision=self.target_model_config.
+                        tokenizer_revision,
+                        max_model_len=None,
+                        spec_target_max_model_len=self.target_model_config.
+                        max_model_len,
+                        quantization=self.target_model_config.quantization,
+                        enforce_eager=self.target_model_config.enforce_eager,
+                        max_seq_len_to_capture=self.target_model_config.
+                        max_seq_len_to_capture,
+                        max_logprobs=self.target_model_config.max_logprobs,
+                        hf_overrides=SpeculativeConfig.hf_config_override,
+                    )
+
+                    self.exit_model_config.append(exit_model_config)
+            
+            if self.sppp_ver=='2.0' or self.sppp_ver=='2.5':
+                self.sppp_len_pred = True
+            else:
+                self.sppp_len_pred = False
+            
+            if self.sppp_len_pred:
+                length_predictor_config_dict = json.load(
+                    open(f"{self.length_predictor_path}/config.json", "r"))
+
+                length_predictor_config_dict["model"] = self.length_predictor_path
+                length_predictor_config_dict["revision"] = self.target_model_config.revision
+                
+                str_dtype = length_predictor_config_dict["dtype"]
+            
+                if str_dtype not in _STR_DTYPE_TO_TORCH_DTYPE:
+                    raise ValueError(f"Unknown dtype: {str_dtype}")
+                torch_dtype = _STR_DTYPE_TO_TORCH_DTYPE[str_dtype]
+                if torch_dtype != self.target_model_config.dtype:
+                    logger.warning(
+                        f"Overriding the dtype of length predictor from {torch_dtype} to {self.target_model_config.dtype} to match the target model config."
+                    )
+                    torch_dtype = self.target_model_config.dtype
+
+                length_predictor_config_dict["dtype"] = torch_dtype
+                
+                self.length_predictor_config = length_predictor_config_dict
+            else:
+                self.length_predictor_config = None
+
+    @classmethod
+    def from_dict(cls, dict_value: dict) -> "SpecPipeConfig":
+        """Parse the CLI value for the speculative config."""
+        return cls(**dict_value)
+
+    def __repr__(self) -> str:
+        return f"SpecPipeConfig(enabled:{self.enable_specpipe}, \
+                exit models: {self.exit_models}, verify strategy: {self.verify_strategy})"
+
+
+@dataclass
 class SpeculativeConfig:
     """
     Configuration for speculative decoding.
@@ -3529,6 +3672,12 @@ class VllmConfig:
     lora_config: Optional[LoRAConfig] = None
     speculative_config: SpeculativeConfig = field(default=None,
                                                   init=True)  # type: ignore
+
+    # [Spexis] Always present so that `specpipe_config.enable_specpipe` is
+    # safe to read on any VllmConfig (defaults to disabled).
+    specpipe_config: SpecPipeConfig = field(default_factory=SpecPipeConfig,
+                                            init=True)
+
     decoding_config: Optional[DecodingConfig] = None
     observability_config: Optional[ObservabilityConfig] = None
     prompt_adapter_config: Optional[PromptAdapterConfig] = None
@@ -3694,6 +3843,14 @@ class VllmConfig:
         if self.cache_config is not None:
             self.cache_config.verify_with_parallel_config(self.parallel_config)
 
+        # [Spexis] exit_layer must specify one flag per pipeline stage.
+        if self.specpipe_config.enable_specpipe:
+            real_pp = self.parallel_config.pipeline_parallel_size
+            specpipe_pp = len(self.specpipe_config.exit_layer)
+            assert real_pp == specpipe_pp, (
+                f"specpipe exit_layer length ({specpipe_pp}) must match "
+                f"pipeline_parallel_size ({real_pp})")
+
         if self.lora_config:
             self.lora_config.verify_with_cache_config(self.cache_config)
             self.lora_config.verify_with_model_config(self.model_config)
@@ -3850,6 +4007,7 @@ class VllmConfig:
         return (
             f"model={self.model_config.model!r},"
             f" speculative_config={self.speculative_config!r},"
+            f" specpipe_config={self.specpipe_config!r},"
             f" tokenizer={self.model_config.tokenizer!r}, "
             f"skip_tokenizer_init={self.model_config.skip_tokenizer_init},"
             f" tokenizer_mode={self.model_config.tokenizer_mode}, "
