@@ -9,7 +9,8 @@ Spexis is a fork of vLLM v0.8.4 (commit dc1b4a6f1300003ae27f033afbdff5e2683721ce
 The following modifications were made to the original software:
 
   * Added vllm/specpipe/, which implements speculative pipeline
-    parallelism: an early-exit draft model per pipeline stage, a
+    parallelism: early-exit draft models attached at pipeline-stage
+    boundaries, a
     scheduler that overlaps speculation with normal execution and
     verifies it one iteration later, confidence-based speculation
     dropping, and lookahead scheduling based on predicted generation

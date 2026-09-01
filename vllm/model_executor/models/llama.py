@@ -308,8 +308,13 @@ class LlamaModel(nn.Module):
                       (lora_config.max_loras or 1)) if lora_config else 0
         self.vocab_size = config.vocab_size + lora_vocab
         self.org_vocab_size = config.vocab_size
-        if not vllm_config.specpipe_config.enable_specpipe and get_pp_group().is_first_rank or (config.tie_word_embeddings
-                                            and get_pp_group().is_last_rank):
+        # [Spexis] with specpipe the first rank receives CPU-computed
+        # embeddings (see specpipe.handle_inputbatch), so it skips the
+        # GPU embedding table.
+        if ((not vllm_config.specpipe_config.enable_specpipe
+             and get_pp_group().is_first_rank)
+                or (config.tie_word_embeddings
+                    and get_pp_group().is_last_rank)):
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
                 config.hidden_size,

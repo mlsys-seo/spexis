@@ -156,7 +156,6 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
-        # scheduling decode stage request from running queue
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -173,6 +172,7 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = (
                     self.scheduler_config.long_prefill_token_threshold)
             num_new_tokens = min(num_new_tokens, token_budget)
+            # [Spexis] enriched diagnostics for speculation debugging.
             assert num_new_tokens > 0, (
                 f"request {request.request_id}: num_new_tokens="
                 f"{num_new_tokens}, num_tokens_with_spec="
@@ -276,7 +276,6 @@ class Scheduler(SchedulerInterface):
         # and put back at the head of the waiting queue later
         skipped_waiting_requests: deque[Request] = deque()
 
-        # scheduling prefill stage request (that never be scheduled includes chunked prefill) from waiting queue ->  move request from waiting to running
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
@@ -320,6 +319,7 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = (
                         self.scheduler_config.long_prefill_token_threshold)
                 num_new_tokens = min(num_new_tokens, token_budget)
+                # [Spexis] enriched diagnostics for speculation debugging.
                 assert num_new_tokens > 0, (
                     f"request {request.request_id}: num_new_tokens="
                     f"{num_new_tokens}, num_tokens={request.num_tokens}, "

@@ -3,7 +3,6 @@
 from concurrent.futures import Future
 from typing import Union
 
-import ray
 
 from vllm.executor.ray_distributed_executor import (  # noqa
     RayDistributedExecutor as RayDistributedExecutorV0)
@@ -23,22 +22,6 @@ class FutureWrapper(Future):
     def result(self, timeout=None):
         if timeout is not None:
             raise NotImplementedError("timeout is not supported")
-        return self.ref.get()
-
-
-class SPFutureWrapper(Future):
-    """A wrapper around a Ray output reference to meet the interface
-    of .execute_model().
-    """
-
-    def __init__(self, ref):
-        super().__init__()
-        self.ref = ref
-
-    def result(self, timeout=None):
-        if timeout is not None:
-            raise NotImplementedError("timeout is not supported")
-        # return ray.get(self.ref)
         return self.ref.get()
 
 
@@ -67,7 +50,6 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
         # Build the compiled DAG for the first time.
         if self.forward_dag is None:  # type: ignore
             self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
-            # self.forward_dag.visualize()
 
         refs = self.forward_dag.execute(scheduler_output)  # type: ignore
 
@@ -79,6 +61,9 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
         # the scheduler can yield to the next batch.
         return FutureWrapper(refs[0])
 
+    # [Spexis] launch the target model and the exit layer as one DAG and
+    # hand back both output futures (see executor/ray_distributed_executor
+    # for the DAG construction).
     def execute_specpipe_model(
         self,
         scheduler_output,
@@ -95,7 +80,6 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
         if self.forward_dag is None:  # type: ignore
             self.forward_dag = self._compiled_specpipe_ray_dag(
                 enable_asyncio=False)
-            # self.forward_dag.visualize()
 
         refs = self.forward_dag.execute(scheduler_output)  # type: ignore
 
@@ -106,7 +90,7 @@ class RayDistributedExecutor(RayDistributedExecutorV0, Executor):
 
         # When PP is used, we return a FutureWrapper immediately so that
         # the scheduler can yield to the next batch.
-        return SPFutureWrapper(refs[0]), SPFutureWrapper(
+        return FutureWrapper(refs[0]), FutureWrapper(
             refs[self.parallel_config.tensor_parallel_size * 1 +
                  0])  # only supports specpipe for gpu 1 now
 

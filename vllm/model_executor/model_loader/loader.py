@@ -17,7 +17,6 @@ from contextlib import contextmanager
 from typing import (Any, Callable, Dict, Generator, Iterable, List, Optional,
                     Tuple, cast)
 
-
 import gguf
 import huggingface_hub
 import numpy as np
@@ -190,6 +189,7 @@ def _process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             # of process_weights_after_loading
             module.process_weights_after_loading(model_config.dtype)
 
+# [Spexis] dict-config variant used by the length-predictor loader.
 def _process_lenpred_weights_after_loading(model: nn.Module, model_config_dict: Dict,
                                    target_device: torch.device) -> None:
     for _, module in model.named_modules():
@@ -465,6 +465,7 @@ class DefaultModelLoader(BaseModelLoader):
         for source in secondary_weights:
             yield from self._get_weights_iterator(source)
     
+    # [Spexis] weight iterator for the length predictor (dict config).
     def get_all_lenpred_weights(
         self,
         model_config_dict: dict,
@@ -523,6 +524,8 @@ class DefaultModelLoader(BaseModelLoader):
 
         return model.eval()
 
+    # [Spexis] loaders for the per-stage exit model and the length
+    # predictor; used only when speculative pipelining is enabled.
     def load_exitmodel(self, vllm_config, model_config, device_config, pp_rank,
                        model_class) -> nn.Module:
         target_device = torch.device(device_config.device)

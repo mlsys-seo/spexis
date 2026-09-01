@@ -209,8 +209,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
                 # NV+AMD GPUs, and Intel XPUs
                 worker = ray.remote(
                     num_cpus=0,
-                    num_gpus=
-                    num_gpus,  # normally 1.0 (one GPU per Ray worker)
+                    num_gpus=num_gpus,
                     scheduling_strategy=scheduling_strategy,
                     **ray_remote_kwargs,
                 )(RayWorkerWrapper).remote(vllm_config=self.vllm_config,

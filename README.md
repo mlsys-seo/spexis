@@ -5,9 +5,10 @@
 Spexis is a multi-GPU LLM inference framework that turns speculation into a
 parallelism axis. Instead of using speculative decoding only to accelerate
 token generation, Spexis runs speculation *in parallel with* normal
-execution: every pipeline stage but the last carries a small early-exit
-(draft) model that speculates while the target model computes, and the
-speculation is verified one pipeline iteration later. Because the
+execution: a small early-exit (draft) model attached to an early
+pipeline stage speculates the next token while the rest of the target
+model is still computing, and the speculation is verified one pipeline
+iteration later. Because the
 speculative tokens ride along with the existing batch, this adds
 parallelism **without increasing KV-cache memory usage**.
 
@@ -110,7 +111,10 @@ vllm serve /path/to/Llama-3.3-70B-Instruct \
 ```
 
 Pass one `--exit-layer` flag and one `--exit-models` entry per pipeline
-stage; stages that do not speculate take the literal string `None`.
+stage; stages that do not speculate take the literal string `None`. The
+interface supports an exit model on any stage, but the released
+artifacts attach one to the first stage only (`exit_1_2` for PP=2,
+`exit_1_4` for PP=4).
 
 Key options:
 

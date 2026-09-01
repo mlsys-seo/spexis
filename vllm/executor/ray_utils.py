@@ -18,8 +18,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.sequence import ExecuteModelRequest, IntermediateTensors
 from vllm.utils import get_ip
-from vllm.distributed.parallel_state import (
-    get_pp_group, get_tp_group)
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.worker.worker_base import WorkerWrapperBase
 from vllm.specpipe.shm import SHM_NAME, MAX_SIZE, FLAG_SIZE, HEADER_SIZE
 
@@ -203,10 +202,7 @@ try:
             # token = sched_out_token[1].get_bool()
             scheduler_output, token = sched_out_token
 
-            # token = token.wait()
-            # token = token.get_bool()
 
-            # assert token == True, f"token was not given as True: {token}"
 
             output = self.worker.model_runner.return_hidden_state(token)
 
@@ -236,9 +232,6 @@ try:
                 assert False, 'exit model should get intermediate tensors input'
                 scheduler_output, intermediate_tensors = scheduler_output, None
             
-            # token = token.wait()
-            # token = token.get_bool()
-            # assert token == True, f"token was not given as True: {token}"
 
             output = self.worker.model_runner.execute_exitlayer_model(
                 scheduler_output, token)

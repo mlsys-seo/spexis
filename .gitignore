@@ -135,7 +135,6 @@ celerybeat.pid
 
 # Environments
 .env
-.env.batch
 .venv
 env/
 venv/
@@ -205,8 +204,3 @@ benchmarks/**/*.json
 actionlint
 shellcheck*/
 
-# GYU: Added to ignore log files
-exp_results/*jsonl
-exp_results/output_text/*.txt
-exp_utils/*.json
-exp_utils/*.jsonl

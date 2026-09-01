@@ -10,7 +10,6 @@ from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional,
                     Tuple, Type, Union, cast, get_args, get_origin)
 
 import torch
-import os
 
 import vllm.envs as envs
 from vllm import version

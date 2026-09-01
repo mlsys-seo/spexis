@@ -321,7 +321,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
         # sets of requests), this optimization becomes very inefficient.
-
         for req_id in unscheduled_req_ids:
             req_index = self.input_batch.remove_request(req_id)
             assert req_index is not None
@@ -385,7 +384,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the states of the running/resumed requests.
         for req_data in scheduler_output.scheduled_cached_reqs:
             req_id = req_data.req_id
-            req_state = self.requests[req_id]  # type: CachedRequestState
+            req_state = self.requests[req_id]
 
             # Update the cached states.
             num_computed_tokens = req_data.num_computed_tokens
@@ -1008,9 +1007,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, torch.Tensor]:
+        # [Spexis] NVTX range for profiling the per-iteration GPU work.
         torch.cuda.nvtx.range_push(msg="execute_model")
         self._update_states(scheduler_output)
-
         if not scheduler_output.total_num_scheduled_tokens:
             # Return empty ModelRunnerOutput if there's no work to do.
             torch.cuda.nvtx.range_pop()
@@ -1026,7 +1025,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Prepare the decoder inputs.
         attn_metadata, logits_indices, spec_decode_metadata = (
             self._prepare_inputs(scheduler_output))
-
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if (self.use_cuda_graph
                 and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
@@ -1262,9 +1260,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
 
-
-
-
     def generate_draft_token_ids(
         self,
         sampled_token_ids: list[list[int]],
@@ -1472,7 +1467,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             with set_forward_context(None,
                                      self.vllm_config,
                                      num_tokens=num_tokens):
-                hidden_states = model(  # [total_tokens_in_batch, hidden]
+                hidden_states = model(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
@@ -1480,8 +1475,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        return hidden_states[logit_indices]  # [batch_size, hidden]
-
+        return hidden_states[logit_indices]
 
     @torch.inference_mode()
     def _dummy_sampler_run(

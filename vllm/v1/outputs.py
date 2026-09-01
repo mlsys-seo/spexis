@@ -100,6 +100,8 @@ class ModelRunnerOutput:
     # [prompt_len]
     prompt_logprobs_dict: dict[str, Optional[LogprobsTensors]]
 
+    # [Spexis] draft-token confidences and predicted-length
+    # probabilities from the exit layer; None on the vanilla path.
     spec_confidence: Optional[list[list[float]]] = None
     length_probs: Optional[list[list[float]]] = None
 
