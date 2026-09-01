@@ -168,7 +168,7 @@ class Request:
             # Handle Drop # times
             if self.confidence_dropped == True or self.stop_dropped == True:
                 # handle previous flushed output
-                # maliscious case: flush + drop ...
+                # malicious case: flush + drop ...
                 if self.spec_result == False:
                     self.just_fixed = False
                     self.flush_len -= 1

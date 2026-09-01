@@ -668,11 +668,17 @@ if _no_device():
 
 if not ext_modules:
     cmdclass = {}
+elif not envs.VLLM_USE_PRECOMPILED:
+    # [Spexis] This fork ships no CUDA kernel sources (csrc/ and the CMake
+    # build were removed); it installs against the prebuilt upstream vLLM
+    # v0.8.4 wheel instead of compiling.
+    raise RuntimeError(
+        "Building from source is not supported by this fork. Set "
+        "VLLM_USE_PRECOMPILED=1 and VLLM_PRECOMPILED_WHEEL_LOCATION to the "
+        "upstream vllm==0.8.4 wheel as described in the README's Install "
+        "section.")
 else:
-    cmdclass = {
-        "build_ext":
-        repackage_wheel if envs.VLLM_USE_PRECOMPILED else cmake_build_ext
-    }
+    cmdclass = {"build_ext": repackage_wheel}
 
 setup(
     # static metadata should rather go in pyproject.toml

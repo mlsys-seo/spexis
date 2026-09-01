@@ -60,9 +60,10 @@ _SPECULATIVE_DECODING_MODELS = {
     'EagleLlamaForCausalLM': ('llama_eagle', 'EagleLlamaForCausalLM'),
 }
 
-_TRANSFORMERS_MODELS = {
-    "TransformersForCausalLM": ("transformers", "TransformersForCausalLM"),
-}
+# [Spexis] The generic Transformers fallback implementation was removed
+# together with the rest of the model zoo; unsupported architectures now
+# fail with the standard unsupported-architecture error.
+_TRANSFORMERS_MODELS = {}
 # yapf: enable
 
 _VLLM_MODELS = {
@@ -285,9 +286,12 @@ class _ModelRegistry:
         normalized_arch = list(
             filter(lambda model: model in self.models, architectures))
 
-        # make sure Transformers backend is put at the last as a fallback
-        if len(normalized_arch) != len(architectures):
-            normalized_arch.append("TransformersForCausalLM")
+        # [Spexis] upstream appended TransformersForCausalLM here as a
+        # generic fallback; that implementation is not shipped in this
+        # fork. Keep the original names when nothing matched so the
+        # unsupported-architecture error can name them.
+        if not normalized_arch:
+            return architectures
         return normalized_arch
 
     def inspect_model_cls(

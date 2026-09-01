@@ -5,9 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Type
 
 import torch
-import transformers
 from torch import nn
-from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from vllm.config import ModelConfig, ModelImpl
 from vllm.logger import init_logger
@@ -30,57 +28,6 @@ def set_default_torch_dtype(dtype: torch.dtype):
     torch.set_default_dtype(old_dtype)
 
 
-def is_transformers_impl_compatible(
-        arch: str,
-        module: Optional["transformers.PreTrainedModel"] = None) -> bool:
-    mod = module or getattr(transformers, arch, None)
-    if mod is None:
-        return False
-    return mod.is_backend_compatible()
-
-
-def resolve_transformers_arch(model_config: ModelConfig,
-                              architectures: list[str]):
-    for i, arch in enumerate(architectures):
-        if arch == "TransformersForCausalLM":
-            continue
-        auto_map: dict[str, str] = getattr(model_config.hf_config, "auto_map",
-                                           None) or dict()
-        # Make sure that config class is always initialized before model class,
-        # otherwise the model class won't be able to access the config class,
-        # the expected auto_map should have correct order like:
-        # "auto_map": {
-        #     "AutoConfig": "<your-repo-name>--<config-name>",
-        #     "AutoModel": "<your-repo-name>--<config-name>",
-        #     "AutoModelFor<Task>": "<your-repo-name>--<config-name>",
-        # },
-        auto_modules = {
-            name: get_class_from_dynamic_module(module, model_config.model)
-            for name, module in sorted(auto_map.items(), key=lambda x: x[0])
-        }
-        custom_model_module = auto_modules.get("AutoModel")
-        # TODO(Isotr0py): Further clean up these raises.
-        # perhaps handled them in _ModelRegistry._raise_for_unsupported?
-        if model_config.model_impl == ModelImpl.TRANSFORMERS:
-            if not is_transformers_impl_compatible(arch, custom_model_module):
-                raise ValueError(
-                    f"The Transformers implementation of {arch} is not "
-                    "compatible with vLLM.")
-            architectures[i] = "TransformersForCausalLM"
-        if model_config.model_impl == ModelImpl.AUTO:
-            if not is_transformers_impl_compatible(arch, custom_model_module):
-                raise ValueError(
-                    f"{arch} has no vLLM implementation and the Transformers "
-                    "implementation is not compatible with vLLM. Try setting "
-                    "VLLM_USE_V1=0.")
-            logger.warning(
-                "%s has no vLLM implementation, falling back to Transformers "
-                "implementation. Some features may not be supported and "
-                "performance may not be optimal.", arch)
-            architectures[i] = "TransformersForCausalLM"
-    return architectures
-
-
 def get_model_architecture(
         model_config: ModelConfig) -> Tuple[Type[nn.Module], str]:
     architectures = getattr(model_config.hf_config, "architectures", [])
@@ -96,12 +43,14 @@ def get_model_architecture(
             and "MixtralForCausalLM" in architectures):
         architectures = ["QuantMixtralForCausalLM"]
 
-    vllm_supported_archs = ModelRegistry.get_supported_archs()
-    is_vllm_supported = any(arch in vllm_supported_archs
-                            for arch in architectures)
-    if (not is_vllm_supported
-            or model_config.model_impl == ModelImpl.TRANSFORMERS):
-        architectures = resolve_transformers_arch(model_config, architectures)
+    # [Spexis] the generic Transformers fallback implementation was
+    # removed with the model zoo; only natively supported architectures
+    # (Llama/Qwen families) can be loaded.
+    if model_config.model_impl == ModelImpl.TRANSFORMERS:
+        raise ValueError(
+            "model_impl='transformers' is not available in this fork; "
+            "the Transformers fallback implementation was removed. "
+            f"Supported architectures: {ModelRegistry.get_supported_archs()}")
 
     model_cls, arch = ModelRegistry.resolve_model_cls(architectures)
     if model_config.task == "embed":

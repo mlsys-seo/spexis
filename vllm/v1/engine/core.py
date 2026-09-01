@@ -412,8 +412,10 @@ class EngineCore:
             vllm_config.scheduler_config.max_num_seqs)
 
     def shutdown(self):
-        self.model_executor.shutdown()
+        # Close the log first so records survive an executor that fails
+        # to shut down cleanly.
         self.iter_logger.close()
+        self.model_executor.shutdown()
         if self.spec_output_shm is not None:
             self.spec_output_shm.close()
             try:

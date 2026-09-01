@@ -42,7 +42,8 @@ Slack="http://slack.vllm.ai/"
 vllm = "vllm.entrypoints.cli.main:main"
 
 [tool.setuptools_scm]
-# no extra settings needed, presence enables setuptools-scm
+# Installs from a tarball (no git metadata) report the fork's base.
+fallback_version = "0.8.4.post1"
 
 [tool.setuptools.packages.find]
 where = ["."]

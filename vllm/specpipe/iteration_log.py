@@ -118,7 +118,8 @@ class IterationLogger:
 
     def _write(self, rec: IterationRecord) -> None:
         if self._file is None:
-            self._file = open(self.path, "a", encoding="utf-8")
+            # Line-buffered so a crash loses at most the current record.
+            self._file = open(self.path, "a", encoding="utf-8", buffering=1)
         self._file.write(rec.to_json())
         self._file.write("\n")
 
