@@ -23,7 +23,7 @@ Spexis is a research prototype released alongside the paper, not a
 production serving stack; only the parts needed for the paper's
 experiments are kept (CUDA, Llama/Qwen families).
 
-📄 **Spexis: Speculative and Lookahead Scheduling for LLM Inference** — to appear at EMNLP 2026.
+📄 [**Spexis: Speculative and Lookahead Scheduling for LLM Inference**](https://arxiv.org/abs/2609.34370) — to appear at EMNLP 2026.
 
 ## Requirements
 
