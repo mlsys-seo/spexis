@@ -157,6 +157,6 @@ files are modified, the changed regions are marked with `[Spexis]`. See
 This is a refactored version of the code used in the Spexis paper; we thank
 the contributors to the original implementation:
 [@hyungyuJung](https://github.com/hyungyuJung), Jaehyuk Yu, [@Hoonseo Choi](https://github.com/hoonseo0316),
-and Sungkyun Kim.
+and [@Sungkyun Kim](https://github.com/SungBalance).
 
 Licensed under Apache-2.0, the same license as vLLM. See `LICENSE`.
