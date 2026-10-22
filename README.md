@@ -67,10 +67,30 @@ existing launch scripts and tooling keep working.
 
 ### Exit-model artifacts
 
-Speculation needs one artifact per target model and pipeline split:
-`exit_1_<pp>/`, the trained early-exit model (`exit_1_2` for PP=2,
-`exit_1_4` for PP=4). Not in this repository yet; release is in
-progress.
+Download the trained weights from
+[Google Drive](https://drive.google.com/drive/folders/1BpBEtlWlKOL-u2wc9q64UsVtIj609TGi). The folder `spexis-weight/` holds:
+
+```
+spexis-weight/
+├── exit-models/
+│   ├── Llama-3.1-8B-Instruct/{exit_1_2/, exit_1_4/}
+│   ├── Llama-3.3-70B-Instruct/{exit_1_2/, exit_1_4/}
+│   ├── Qwen3-8B/{exit_1_2/, exit_1_4/}
+│   └── Qwen3-32B/{exit_1_2/, exit_1_4/}
+└── length-predictors/
+    ├── Llama-3.3-70B-Instruct/{exit_1_2/, exit_1_4/}
+    └── Qwen3-32B/{exit_1_2/, exit_1_4/}
+```
+
+- `exit-models/<model>/exit_1_<pp>/` — the trained early-exit model for
+  that target and pipeline split (`exit_1_2` for PP=2, `exit_1_4` for
+  PP=4); pass it to `--exit-models`.
+- `length-predictors/<model>/exit_1_<pp>/` — the length predictor used
+  by length-aware scheduling (`--spexis-ver 2.5`); pass it to
+  `--length-predictor-path`.
+
+Use the directory matching both your target model and your pipeline
+size; they are not interchangeable.
 
 The first stage looks token embeddings up on the CPU instead of holding
 them on the GPU. That table is read directly from the target checkpoint
