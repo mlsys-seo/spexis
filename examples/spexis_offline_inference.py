@@ -8,12 +8,12 @@ without an exit model take the literal string "None".
 
     python examples/spexis_offline_inference.py \
         --model /path/to/Llama-3.3-70B-Instruct \
-        --exit-model-dir /path/to/exitmodels/Llama-3.3-70B-Instruct
+        --exit-model-dir /path/to/spexis-weight/exit-models/Llama-3.3-70B-Instruct
 
 The exit-model directory must contain the trained exit model for the
-split (exit_1_2 for PP=2, exit_1_4 for PP=4) and embed_tokens.bin, the
-target model's embedding weights (the first stage looks embeddings up on
-the CPU instead of holding them on the GPU).
+split (exit_1_2 for PP=2, exit_1_4 for PP=4). The first stage looks token
+embeddings up on the CPU instead of holding them on the GPU; that table
+is read from the target checkpoint (--model) itself.
 """
 
 import argparse
@@ -26,8 +26,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Target model path.")
     parser.add_argument("--exit-model-dir", required=True,
-                        help="Directory holding exit_1_<pp> and "
-                             "embed_tokens.bin for this target model.")
+                        help="Directory holding exit_1_<pp> for this "
+                             "target model.")
     parser.add_argument("--pipeline-parallel-size", type=int, default=2)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--exit-model-type", default="llama",
@@ -53,16 +53,13 @@ def main() -> None:
 
     if not args.baseline:
         exit_model = os.path.join(args.exit_model_dir, f"exit_1_{pp_size}")
-        embeddings = os.path.join(args.exit_model_dir, "embed_tokens.bin")
-        for path in (exit_model, embeddings):
-            if not os.path.exists(path):
-                raise SystemExit(f"missing exit-model artifact: {path}")
+        if not os.path.exists(exit_model):
+            raise SystemExit(f"missing exit-model artifact: {exit_model}")
         engine_kwargs.update(
             enable_spexis=True,
             # Stage 0 speculates; later stages only verify.
             exit_layer=[True] + [False] * (pp_size - 1),
             exit_models=[exit_model] + ["None"] * (pp_size - 1),
-            cpu_embedding_path=embeddings,
             exit_model_type=args.exit_model_type,
             verify_strategy="greedy",
             drop_ratio=0.0,

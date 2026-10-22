@@ -234,7 +234,6 @@ class EngineArgs:
     spexis_ver: str = '1.0'  # 1.0 / 2.0 / 2.5 (see SpexisConfig.spexis_ver)
     exit_layer: Optional[List[bool]] = None  # len = p.p.
     exit_models: Optional[List[str]] = None  # len = p.p.
-    cpu_embedding_path: str = None  # path to cpu embedding weights
     length_predictor_path: str = None  # path to length predictor weights
     verify_strategy: str = 'greedy'  # only greedy is implemented
     drop_ratio: float = 0.0  # 0~1, la_sched1 drop fraction (ver >= 2.0)
@@ -1069,15 +1068,6 @@ class EngineArgs:
 
         # str from command line
         parser.add_argument(
-            '--cpu-embedding-path',
-            type=str,
-            default=None, 
-            help= \
-            'Path to CPU embedding weights (e.g. --cpu-embedding-path emb_tokens.bin)'
-        )
-
-        # str from command line
-        parser.add_argument(
             '--length-predictor-path',
             type=str,
             default=None, 
@@ -1369,7 +1359,6 @@ class EngineArgs:
             target_model_config=model_config,
             exit_layer=self.exit_layer,
             exit_models=self.exit_models,
-            cpu_embedding_path=self.cpu_embedding_path,
             length_predictor_path=self.length_predictor_path,
             verify_strategy=self.verify_strategy,
             drop_ratio=self.drop_ratio,

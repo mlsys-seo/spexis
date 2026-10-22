@@ -23,15 +23,14 @@ long as the directory *structure* matches.
 $MODEL_DIR                 # target model: a standard HF checkpoint
                            #   (e.g. meta-llama/Llama-3.3-70B-Instruct, Qwen/Qwen3-32B)
 
-$EXIT_MODEL_DIR            # e.g. /path/to/exitmodels/Llama-3.3-70B-Instruct/
+$EXIT_MODEL_DIR            # e.g. /path/to/spexis-weight/exit-models/Llama-3.3-70B-Instruct/
   exit_1_2/                # early-exit (draft) model for the PP=2 split
     config.json
     pytorch_model.bin
   exit_1_4/                # same structure, trained for the PP=4 split
-  embed_tokens.bin         # the target's embedding table for the CPU lookup
 
 $LENGTH_PREDICTOR_DIR      # SPEXIS_VER=2.5 only, e.g.
-                           #   /path/to/length-predictor/Llama-3.3-70B-Instruct/
+                           #   /path/to/spexis-weight/length-predictors/Llama-3.3-70B-Instruct/
 ```
 
 **Exit models.** Each `exit_1_<pp>/` directory is a self-contained
@@ -44,12 +43,9 @@ per split point (`exit_1_2` = after 1/2 of the layers, `exit_1_4` =
 after 1/4); the directories are not interchangeable. The scripts pick
 `exit_1_2` or `exit_1_4` automatically from the PP size.
 
-`embed_tokens.bin` is `torch.save({"embed_tokens.weight": tensor})` --
-the target's input-embedding table, which the first pipeline stage
-looks up on the CPU instead of holding a GPU copy. It is part of the
-target model's own weights and therefore not distributed with the exit
-models; generate it with
-`python tools/extract_embed_tokens.py --model <target> --output <exit-model-dir>/embed_tokens.bin`.
+The first pipeline stage looks token embeddings up on the CPU instead
+of holding a GPU copy; the engine reads that table straight from
+`$MODEL_DIR` (only the shard holding `model.embed_tokens.weight`).
 
 **Length predictor** (`SPEXIS_VER=2.5`). A small MLP over the exit
 layer's hidden state that predicts the probability that a request's
@@ -57,11 +53,11 @@ remaining length exceeds each threshold. Like the exit models it is
 trained per target and per split, laid out as:
 
 ```
-length-predictor/
+length-predictors/
   Llama-3.3-70B-Instruct/
     exit_1_2/
-      config.json          # in_dim, hidden, thresholds_list, dropout_p, dtype
-      <weights>.pt         # any single *.pt file; discovered by glob
+      config.json          # in_dim, hidden, thresholds_list, dropout_p
+      model.safetensors
     exit_1_4/
   Qwen3-32B/
 ```
@@ -93,7 +89,7 @@ process at a set of request rates for a fixed duration.
 ```bash
 cd experiments/serving
 MODEL_DIR=/path/to/Llama-3.3-70B-Instruct \
-EXIT_MODEL_DIR=/path/to/exitmodels/Llama-3.3-70B-Instruct \
+EXIT_MODEL_DIR=/path/to/spexis-weight/exit-models/Llama-3.3-70B-Instruct \
 DATASET_PATH=/path/to/spec_bench/question.jsonl \
 PP_TP_PAIRS="2,4" SPEXIS_OPTS="True False" SPEXIS_VER=1.0 \
 REQUEST_RATES="3.8 4.0 4.2" \
@@ -120,7 +116,7 @@ accuracy).
 ```bash
 cd experiments/throughput
 MODEL_DIR=/path/to/Llama-3.3-70B-Instruct \
-EXIT_MODEL_DIR=/path/to/exitmodels/Llama-3.3-70B-Instruct \
+EXIT_MODEL_DIR=/path/to/spexis-weight/exit-models/Llama-3.3-70B-Instruct \
 DATASET_PATH=/path/to/spec_bench/question.jsonl \
 PP_TP_PAIRS="2,1" BATCH_SIZES="16 32 64" \
 ./run_fixed_batch.sh

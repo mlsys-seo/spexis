@@ -2041,7 +2041,6 @@ class SpexisConfig:
     target_model_config: ModelConfig = None
     exit_layer: list[int] = None
     exit_models: list[str] = None
-    cpu_embedding_path: str = None
     length_predictor_path: str = None
     # Speculation verification strategy. Only "greedy" is implemented:
     # spec tokens are verified by exact match against the target model's
@@ -2164,26 +2163,18 @@ class SpexisConfig:
                 assert self.length_predictor_path is not None, (
                     "spexis_ver 2.5 (length-aware scheduling) requires "
                     "--length-predictor-path")
-                length_predictor_config_dict = json.load(
-                    open(f"{self.length_predictor_path}/config.json", "r"))
-
-                length_predictor_config_dict["model"] = self.length_predictor_path
-                length_predictor_config_dict["revision"] = self.target_model_config.revision
-                
-                str_dtype = length_predictor_config_dict["dtype"]
-            
-                if str_dtype not in _STR_DTYPE_TO_TORCH_DTYPE:
-                    raise ValueError(f"Unknown dtype: {str_dtype}")
-                torch_dtype = _STR_DTYPE_TO_TORCH_DTYPE[str_dtype]
-                if torch_dtype != self.target_model_config.dtype:
-                    logger.warning(
-                        f"Overriding the dtype of length predictor from {torch_dtype} to {self.target_model_config.dtype} to match the target model config."
-                    )
-                    torch_dtype = self.target_model_config.dtype
-
-                length_predictor_config_dict["dtype"] = torch_dtype
-                
-                self.length_predictor_config = length_predictor_config_dict
+                with open(f"{self.length_predictor_path}/config.json") as f:
+                    hf_config = json.load(f)
+                # The predictor reads the exit layer's hidden states, so it
+                # runs in the target model's dtype.
+                self.length_predictor_config = {
+                    "model": self.length_predictor_path,
+                    "in_dim": hf_config["in_dim"],
+                    "hidden": hf_config["hidden"],
+                    "thresholds_list": hf_config["thresholds_list"],
+                    "dropout_p": hf_config["dropout_p"],
+                    "dtype": self.target_model_config.dtype,
+                }
             else:
                 self.length_predictor_config = None
 

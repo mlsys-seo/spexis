@@ -113,7 +113,6 @@ for pair in $PP_TP_PAIRS; do
                     --exit-model-type "$EXIT_MODEL_TYPE"
                     --exit-layer $exit_layer_flags
                     --exit-models $exit_models_args
-                    --cpu-embedding-path "$EXIT_MODEL_DIR/embed_tokens.bin"
                 )
                 if [[ "$SPEXIS_VER" == "2.5" ]]; then
                     CMD+=( --length-predictor-path "$lenpred_path" )

@@ -8,6 +8,7 @@ import fnmatch
 import glob
 import inspect
 import itertools
+import json
 import math
 import os
 import time
@@ -22,6 +23,7 @@ import huggingface_hub
 import numpy as np
 import torch
 from huggingface_hub import HfApi
+from safetensors import safe_open
 from torch import nn
 from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
@@ -471,23 +473,15 @@ class DefaultModelLoader(BaseModelLoader):
         model_config_dict: dict,
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        # A local directory holding a single model.safetensors.
         primary_weights = DefaultModelLoader.Source(
             model_config_dict["model"],
-            model_config_dict["revision"],
+            revision=None,
             prefix="",
-            fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load",
-                                    True),
-            allow_patterns_overrides=getattr(model, "allow_patterns_overrides",
-                                             None),
+            fall_back_to_pt=False,
+            allow_patterns_overrides=["*.safetensors"],
         )
         yield from self._get_weights_iterator(primary_weights)
-
-        secondary_weights = cast(
-            Iterable[DefaultModelLoader.Source],
-            getattr(model, "secondary_weights", ()),
-        )
-        for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model,
@@ -572,8 +566,7 @@ class DefaultModelLoader(BaseModelLoader):
                         in_dim=model_config_dict["in_dim"],
                         thresholds_list=model_config_dict["thresholds_list"],
                         hidden=model_config_dict["hidden"],
-                        dropout_p=model_config_dict["dropout_p"],
-                        prefix="lengthpredictor",)
+                        dropout_p=model_config_dict["dropout_p"])
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
@@ -598,6 +591,60 @@ class DefaultModelLoader(BaseModelLoader):
                                                    target_device)
 
         return model.eval()
+
+    def load_cpu_embed_tokens(self,
+                              model_config: ModelConfig) -> torch.Tensor:
+        """Read the target model's embedding table for the CPU lookup.
+
+        With Spexis the first pipeline stage holds no GPU embedding table;
+        the engine core looks embeddings up on the CPU instead. The table
+        is read straight out of the target checkpoint, opening (and, for a
+        hub model id, downloading) only the shard that holds it.
+        """
+        weight_name = "model.embed_tokens.weight"
+        model = model_config.model
+        cache_dir = self.load_config.download_dir
+
+        def get_file(filename: str) -> Optional[str]:
+            if os.path.isdir(model):
+                path = os.path.join(model, filename)
+                return path if os.path.exists(path) else None
+            with get_lock(model, cache_dir):
+                try:
+                    return huggingface_hub.hf_hub_download(
+                        repo_id=model,
+                        filename=filename,
+                        cache_dir=cache_dir,
+                        revision=model_config.revision,
+                        local_files_only=huggingface_hub.constants.
+                        HF_HUB_OFFLINE,
+                    )
+                except (huggingface_hub.utils.EntryNotFoundError,
+                        huggingface_hub.utils.LocalEntryNotFoundError):
+                    return None
+
+        index_path = get_file(SAFE_WEIGHTS_INDEX_NAME)
+        if index_path is not None:
+            with open(index_path) as f:
+                weight_map = json.load(f)["weight_map"]
+            if weight_name not in weight_map:
+                raise KeyError(f"{weight_name} not listed in {index_path}")
+            shard_name = weight_map[weight_name]
+        else:
+            shard_name = "model.safetensors"
+
+        shard = get_file(shard_name)
+        if shard is None:
+            raise FileNotFoundError(
+                f"Cannot find {shard_name} for the CPU embedding lookup "
+                f"under `{model}`; Spexis needs a safetensors checkpoint.")
+        start = time.perf_counter()
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            embed_tokens = f.get_tensor(weight_name)
+        logger.info("Loading CPU embed_tokens %s from %s took %.2f seconds",
+                    tuple(embed_tokens.shape), os.path.basename(shard),
+                    time.perf_counter() - start)
+        return embed_tokens
 
 
 class DummyModelLoader(BaseModelLoader):

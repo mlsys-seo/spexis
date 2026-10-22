@@ -10,8 +10,6 @@ from inspect import isclass, signature
 from logging import DEBUG
 from typing import Any, Callable, Optional, TypeVar, Union
 
-import torch
-
 import msgspec
 import psutil
 import zmq
@@ -26,6 +24,8 @@ from spexis.distributed import stateless_destroy_torch_distributed_process_group
 from spexis.executor.multiproc_worker_utils import _add_prefix
 from spexis.logger import init_logger
 from spexis.lora.request import LoRARequest
+from spexis.model_executor.model_loader.loader import (DefaultModelLoader,
+                                                     get_model_loader)
 from spexis.spec_parallel.scheduler import SpexisScheduler
 from spexis.transformers_utils.config import (
     maybe_register_config_serialize_by_value)
@@ -401,11 +401,10 @@ class EngineCore:
         logger.info("Initialized Spexis shared memory segment %s (%d bytes)",
                     SHM_NAME, MAX_SIZE)
 
-        # Checkpoint holding just the target model's embedding weights; see
-        # the exit-model artifacts in the README.
-        weights = torch.load(vllm_config.spexis_config.cpu_embedding_path,
-                             map_location="cpu")
-        embed_tokens = weights["embed_tokens.weight"].cpu()
+        loader = get_model_loader(vllm_config.load_config)
+        assert isinstance(loader, DefaultModelLoader), (
+            f"loader was not DefaultModelLoader: {type(loader)}")
+        embed_tokens = loader.load_cpu_embed_tokens(vllm_config.model_config)
         # Match the model dtype and pin so the per-iteration lookup can be
         # copied to the device without an extra staging buffer.
         self.embed_tokens = embed_tokens.to(

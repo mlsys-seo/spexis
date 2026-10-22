@@ -67,21 +67,15 @@ existing launch scripts and tooling keep working.
 
 ### Exit-model artifacts
 
-Speculation needs two artifacts per target model:
+Speculation needs one artifact per target model and pipeline split:
+`exit_1_<pp>/`, the trained early-exit model (`exit_1_2` for PP=2,
+`exit_1_4` for PP=4). Not in this repository yet; release is in
+progress.
 
-- `exit_1_<pp>/` — the trained early-exit model for that pipeline split
-  (`exit_1_2` for PP=2, `exit_1_4` for PP=4). Not in this repository
-  yet; release is in progress.
-- `embed_tokens.bin` — the target model's embedding weights, which the
-  first stage looks up on the CPU instead of holding on the GPU. This is
-  part of the target model's own weights, so it is not distributed;
-  generate it from the checkpoint you downloaded:
-
-  ```bash
-  python tools/extract_embed_tokens.py \
-      --model /path/to/Llama-3.3-70B-Instruct \
-      --output /path/to/exitmodels/Llama-3.3-70B-Instruct/embed_tokens.bin
-  ```
+The first stage looks token embeddings up on the CPU instead of holding
+them on the GPU. That table is read directly from the target checkpoint
+(only the safetensors shard holding `model.embed_tokens.weight` is
+opened), so no separate embedding file is needed.
 
 ## Quick start
 
@@ -90,13 +84,13 @@ Offline inference with speculative parallelism on two GPUs:
 ```bash
 python examples/spexis_offline_inference.py \
     --model /path/to/Llama-3.3-70B-Instruct \
-    --exit-model-dir /path/to/exitmodels/Llama-3.3-70B-Instruct \
+    --exit-model-dir /path/to/spexis-weight/exit-models/Llama-3.3-70B-Instruct \
     --pipeline-parallel-size 2
 
 # Plain pipeline parallelism, for comparison
 python examples/spexis_offline_inference.py \
     --model /path/to/Llama-3.3-70B-Instruct \
-    --exit-model-dir /path/to/exitmodels/Llama-3.3-70B-Instruct \
+    --exit-model-dir /path/to/spexis-weight/exit-models/Llama-3.3-70B-Instruct \
     --baseline
 ```
 
@@ -107,8 +101,7 @@ spexis serve /path/to/Llama-3.3-70B-Instruct \
     --pipeline-parallel-size 2 --distributed-executor-backend ray \
     --enable-spexis True \
     --exit-layer True False \
-    --exit-models /path/to/exitmodels/.../exit_1_2 None \
-    --cpu-embedding-path /path/to/exitmodels/.../embed_tokens.bin \
+    --exit-models /path/to/spexis-weight/exit-models/.../exit_1_2 None \
     --exit-model-type llama --verify-strategy greedy
 ```
 
@@ -122,7 +115,6 @@ Key options:
 | `--enable-spexis` | Turn on speculative parallelism |
 | `--spexis-ver` | `1.0` speculative parallelism only; `2.0` + confidence-based drop; `2.5` + length-aware scheduling (needs `--length-predictor-path`). Cumulative; the paper uses `2.5` |
 | `--exit-layer` / `--exit-models` | Per-stage: does this stage run an exit model, and with which weights |
-| `--cpu-embedding-path` | Target-model embedding weights, looked up on the CPU |
 | `--exit-model-type` | `llama` or `qwen` |
 | `--drop-ratio` | Fraction of the batch dropped from speculation each iteration, lowest confidence first (`--spexis-ver` >= 2.0) |
 | `--enable-log`, `--logdir` | Write the per-iteration metrics log (JSONL) |

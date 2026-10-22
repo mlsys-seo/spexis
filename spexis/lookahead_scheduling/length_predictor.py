@@ -22,19 +22,19 @@ class LengthPredictor(nn.Module):
         thresholds_list: List[int], 
         hidden: int = 512, 
         dropout_p: float = 0.1, 
-        prefix: str = "",
         ):
         
         super().__init__()
 
         # Metadata
-        self.prefix = prefix
         self.num_classes = len(thresholds_list)
         self.thresholds_list = thresholds_list
 
         # 1. Feature Extractor (Backbone)
         # Input: LLM hidden states (in_dim)
         # Output: Feature vector (hidden)
+        # Dropout only matters in training; the loader returns the model
+        # in eval mode, where it is a no-op.
         self.backbone = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.GELU(),
