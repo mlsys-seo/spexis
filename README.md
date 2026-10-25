@@ -1,6 +1,7 @@
 # Spexis
 
 **Speculative and Lookahead Scheduling for LLM Inference**
+[![Paper](https://img.shields.io/badge/EMNLP-2026-blue)](https://aclanthology.org/2026.emnlp-main.29/)
 
 Spexis is a multi-GPU LLM inference framework that improves the
 efficiency of pipeline and tensor parallelism through *speculative
@@ -22,8 +23,6 @@ of pipeline and tensor parallelism.
 Spexis is a research prototype released alongside the paper, not a
 production serving stack; only the parts needed for the paper's
 experiments are kept (CUDA, Llama/Qwen families).
-
-📄 [**Spexis: Speculative and Lookahead Scheduling for LLM Inference**](https://arxiv.org/abs/2609.34370) — to appear at EMNLP 2026 main.
 
 ## Requirements
 
@@ -153,9 +152,20 @@ See `experiments/README.md` for datasets, knobs, and output formats.
 
 ## Citation
 
-*Spexis: Speculative and Lookahead Scheduling for LLM Inference* is to
-appear at EMNLP 2026. The paper link and BibTeX entry will be added here
-once the proceedings are published.
+If you find Spexis useful in your research, please consider citing our paper:
+
+```bibtex
+@inproceedings{jung-etal-2026-spexis,
+  title     = {Spexis: Speculative Lookahead Scheduling for {LLM} Inference},
+  author    = {Jung, Hyungyu and Yu, Jaehyeok and Choi, Hoonseo and Kim, Sungkyun and Lee, Jinho and Seo, Jiwon},
+  booktitle = {Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing (EMNLP)},
+  pages     = {627--638},
+  year      = {2026},
+  address   = {Budapest, Hungary},
+  publisher = {Association for Computational Linguistics},
+  url       = {https://aclanthology.org/2026.emnlp-main.29/}
+}
+```
 
 ## Acknowledgment
 
